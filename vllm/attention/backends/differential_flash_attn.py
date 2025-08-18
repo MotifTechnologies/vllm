@@ -808,6 +808,7 @@ class DifferentialFlashAttentionImpl(AttentionImpl):
                     window_size=self.sliding_window,
                     alibi_slopes=self.alibi_slopes,
                     softcap=self.logits_soft_cap,
+                    fa_version=self.vllm_flash_attn_version,
                 )
                 assert prefill_output.shape == output[:
                                                       num_prefill_tokens].shape
@@ -829,6 +830,7 @@ class DifferentialFlashAttentionImpl(AttentionImpl):
                     window_size=self.sliding_window,
                     alibi_slopes=self.alibi_slopes,
                     softcap=self.logits_soft_cap,
+                    fa_version=self.vllm_flash_attn_version,
                 ).squeeze(1)
             except Exception as e:
                 logger.error("Error in PagedAttention.forward_decode: %s",
@@ -861,6 +863,7 @@ class DifferentialFlashAttentionImpl(AttentionImpl):
             window_size=self.sliding_window,
             alibi_slopes=self.alibi_slopes,
             softcap=self.logits_soft_cap,
+            fa_version=self.vllm_flash_attn_version,
         ).squeeze(1)
         return output
 
