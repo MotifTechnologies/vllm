@@ -231,14 +231,22 @@ poly_norm_kernel(scalar_t* __restrict__ out,           // [..., hidden_size]
     variance3 += x6;
   }
 
-  using BlockReduce = cub::BlockReduce<float, 1024>;
-  __shared__ typename BlockReduce::TempStorage reduceStore;
+  float3 thread_variances = make_float3(variance, variance2, variance3);
 
-  variance = BlockReduce(reduceStore).Sum(variance, blockDim.x);
-  __syncthreads();
-  variance2 = BlockReduce(reduceStore).Sum(variance2, blockDim.x);
-  __syncthreads();
-  variance3 = BlockReduce(reduceStore).Sum(variance3, blockDim.x);
+  struct SumOp {
+    __device__ float3 operator()(const float3& a, const float3& b) const {
+      return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);
+    }
+  };
+
+  using BlockReduce = cub::BlockReduce<float3, 1024>;
+  __shared__ typename BlockReduce::TempStorage reduceStore;
+  float3 block_variances =
+      BlockReduce(reduceStore).Reduce(thread_variances, SumOp{}, blockDim.x);
+
+  variance = block_variances.x;
+  variance2 = block_variances.y;
+  variance3 = block_variances.z;
 
   __shared__ float s_w2_inv_std;
   __shared__ float s_w1_inv_std2;
@@ -292,14 +300,22 @@ poly_norm_kernel(scalar_t* __restrict__ out,           // [..., hidden_size]
     variance3 += x6;
   }
 
-  using BlockReduce = cub::BlockReduce<float, 1024>;
-  __shared__ typename BlockReduce::TempStorage reduceStore;
+  float3 thread_variances = make_float3(variance, variance2, variance3);
 
-  variance = BlockReduce(reduceStore).Sum(variance, blockDim.x);
-  __syncthreads();
-  variance2 = BlockReduce(reduceStore).Sum(variance2, blockDim.x);
-  __syncthreads();
-  variance3 = BlockReduce(reduceStore).Sum(variance3, blockDim.x);
+  struct SumOp {
+    __device__ float3 operator()(const float3& a, const float3& b) const {
+      return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);
+    }
+  };
+
+  using BlockReduce = cub::BlockReduce<float3, 1024>;
+  __shared__ typename BlockReduce::TempStorage reduceStore;
+  float3 block_variances =
+      BlockReduce(reduceStore).Reduce(thread_variances, SumOp{}, blockDim.x);
+
+  variance = block_variances.x;
+  variance2 = block_variances.y;
+  variance3 = block_variances.z;
 
   __shared__ float s_w2_inv_std;
   __shared__ float s_w1_inv_std2;
