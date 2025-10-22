@@ -22,6 +22,7 @@ from vllm.attention.utils.fa_utils import (
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
+from vllm.platforms import current_platform
 
 if is_flash_attn_varlen_func_available():
     from vllm.attention.utils.fa_utils import (
@@ -29,6 +30,10 @@ if is_flash_attn_varlen_func_available():
         get_scheduler_metadata,
         reshape_and_cache_flash,
     )
+elif current_platform.is_rocm():
+    from vllm.attention.ops.triton_unified_attention import unified_attention
+
+    reshape_and_cache_flash = ops.reshape_and_cache_flash
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
@@ -721,24 +726,49 @@ class GroupedDifferentialAttentionImpl(AttentionImpl):
 
         descale_shape = (cu_seqlens_q.shape[0] - 1, key.shape[1])
 
-        return flash_attn_varlen_func(
-            q=query[:num_actual_tokens],
-            k=key_cache,
-            v=value_cache,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            seqused_k=seqused_k,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=self.scale,
-            causal=True,
-            alibi_slopes=self.alibi_slopes,
-            window_size=self.sliding_window,
-            block_table=block_table,
-            softcap=self.logits_soft_cap,
-            scheduler_metadata=scheduler_metadata,
-            fa_version=self.vllm_flash_attn_version,
-            q_descale=layer._q_scale.expand(descale_shape),
-            k_descale=layer._k_scale.expand(descale_shape),
-            v_descale=layer._v_scale.expand(descale_shape),
-            num_splits=attn_metadata.max_num_splits,
-        )
+        if current_platform.is_rocm():
+            output = torch.zeros_like(query)
+            unified_attention(
+                q=query[:num_actual_tokens],
+                k=key_cache,
+                v=value_cache,
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=seqused_k,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=True,
+                alibi_slopes=self.alibi_slopes,
+                window_size=self.sliding_window,
+                block_table=block_table,
+                softcap=self.logits_soft_cap,
+                q_descale=None,  # Not supported
+                k_descale=layer._k_scale.expand(descale_shape),
+                v_descale=layer._v_scale.expand(descale_shape),
+                sinks=None,
+                output_scale=output_scale,
+            )
+            return output
+        else:
+            return flash_attn_varlen_func(
+                q=query[:num_actual_tokens],
+                k=key_cache,
+                v=value_cache,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                seqused_k=seqused_k,
+                max_seqlen_k=max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=True,
+                alibi_slopes=self.alibi_slopes,
+                window_size=self.sliding_window,
+                block_table=block_table,
+                softcap=self.logits_soft_cap,
+                scheduler_metadata=scheduler_metadata,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=layer._q_scale.expand(descale_shape),
+                k_descale=layer._k_scale.expand(descale_shape),
+                v_descale=layer._v_scale.expand(descale_shape),
+                num_splits=attn_metadata.max_num_splits,
+            )

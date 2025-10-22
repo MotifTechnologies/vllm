@@ -257,6 +257,15 @@ class RocmPlatform(Platform):
                 f" The selected backend, {selected_backend.name},"
                 f"is not MLA type while requested for MLA backend."
             )
+        if selected_backend == _Backend.DIFFERENTIAL_FLASH_ATTN:
+            assert envs.VLLM_USE_V1, (
+                "In ROCm, DifferentialFlashAttention only supports at V1"
+            )
+            DIFFERENTIAL_FLASH_ATTN_V1 = "vllm.v1.attention.backends.differential_flash_attn.DifferentialFlashAttentionBackend"  # noqa: E501
+            return DIFFERENTIAL_FLASH_ATTN_V1
+
+        if selected_backend is None or selected_backend == _Backend.FLASH_ATTN:
+            selected_backend = _Backend.ROCM_FLASH
 
         if selected_backend == AttentionBackendEnum.FLEX_ATTENTION:
             logger.info("Using FlexAttention backend.")
