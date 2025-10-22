@@ -260,7 +260,7 @@ class RocmPlatform(Platform):
         if selected_backend == _Backend.DIFFERENTIAL_FLASH_ATTN:
             assert envs.VLLM_USE_V1, (
                 "In ROCm, DifferentialFlashAttention only supports at V1"
-            )
+            )  # noqa: E501
             DIFFERENTIAL_FLASH_ATTN_V1 = "vllm.v1.attention.backends.differential_flash_attn.DifferentialFlashAttentionBackend"  # noqa: E501
             return DIFFERENTIAL_FLASH_ATTN_V1
 
