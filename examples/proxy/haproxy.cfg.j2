@@ -1,0 +1,23 @@
+global
+    log stdout format raw daemon
+    maxconn 4096
+    daemon
+
+defaults
+    mode http
+    timeout connect 5s
+    timeout client  30s
+    timeout server  30s
+    option httplog
+    option dontlognull
+
+frontend vllm_front
+    bind *:{{ proxy_port }}
+    default_backend vllm_back
+
+backend vllm_back
+    balance roundrobin
+    {%- for ip in vllm_servers %}
+    server vllm{{ loop.index }} {{ ip }}:{{ vllm_port }} check
+    {%- endfor %}
+
