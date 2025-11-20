@@ -1,0 +1,45 @@
+name: Build Docker Images
+
+on:
+  push:
+    branches: ["motif"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+
+jobs:
+  compute-latest:
+    uses: MotifTechnologies/docker-image-ci-templates/.github/workflows/should-tag-latest.yml@v1
+    with:
+      branch: "motif"
+
+  build-cuda:
+    needs: compute-latest
+    uses: MotifTechnologies/docker-image-ci-templates/.github/workflows/docker-build.yml@v1
+    with:
+      group: cuda
+      push: true
+      is_latest: ${{ fromJSON(needs.compute-latest.outputs.is_latest) }}
+      runner: docker-builder-01
+      skip_patterns: "skip-cuda,skip-build"
+      extra_set: |
+        vllm_rocm.args.MAX_JOBS=32
+    secrets:
+      GHCR_PAT: ${{ secrets.GHCR_PAT }}
+
+  build-rocm:
+    needs: compute-latest
+    uses: MotifTechnologies/docker-image-ci-templates/.github/workflows/docker-build.yml@v1
+    with:
+      group: rocm
+      push: true
+      is_latest: ${{ fromJSON(needs.compute-latest.outputs.is_latest) }}
+      runner: docker-builder-01
+      skip_patterns: "skip-rocm,skip-build"
+    secrets:
+      GHCR_PAT: ${{ secrets.GHCR_PAT }}
+
+
