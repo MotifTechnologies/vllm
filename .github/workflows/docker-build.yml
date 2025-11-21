@@ -25,8 +25,6 @@ jobs:
       is_latest: ${{ fromJSON(needs.compute-latest.outputs.is_latest) }}
       runner: docker-builder-01
       skip_patterns: "skip-cuda,skip-build"
-      extra_set: |
-        vllm_rocm.args.MAX_JOBS=32
     secrets:
       GHCR_PAT: ${{ secrets.GHCR_PAT }}
 
