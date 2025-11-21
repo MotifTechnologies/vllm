@@ -1,7 +1,7 @@
 # default base image
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
-ARG BASE_IMAGE=rocm/vllm-dev:base
+ARG BASE_IMAGE=rocm_base
 
 FROM ${BASE_IMAGE} AS base
 
@@ -10,10 +10,10 @@ ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 ENV RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES=1
 ENV RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
 
-# Install some basic utilities
+# Install some basic utilities and haproxy
 RUN apt-get update -q -y && apt-get install -q -y \
     sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev \
-    apt-transport-https ca-certificates wget curl
+    apt-transport-https ca-certificates wget curl tmux haproxy
 # Remove sccache
 RUN python3 -m pip install --upgrade pip
 RUN apt-get purge -y sccache; python3 -m pip uninstall -y sccache; rm -f "$(which sccache)"
@@ -37,15 +37,12 @@ WORKDIR ${COMMON_WORKDIR}
 FROM base AS fetch_vllm_0
 ONBUILD COPY ./ vllm/
 FROM base AS fetch_vllm_1
-ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
-ARG VLLM_BRANCH="main"
+ARG VLLM_REPO="https://github.com/MotifTechnologies/vllm_internal.git"
+ARG VLLM_BRANCH="motif"
 ONBUILD RUN git clone ${VLLM_REPO} \
 	    && cd vllm \
 	    && git fetch -v --prune -- origin ${VLLM_BRANCH} \
-	    && git checkout FETCH_HEAD \
-        && if [ ${VLLM_REPO} != "https://github.com/vllm-project/vllm.git" ] ; then \
-               git remote add upstream "https://github.com/vllm-project/vllm.git" \
-               && git fetch upstream ; fi
+	    && git checkout FETCH_HEAD
 FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 
 # -----------------------
@@ -91,6 +88,7 @@ COPY --from=build_vllm ${COMMON_WORKDIR}/vllm /vllm-workspace
 # install development dependencies (for testing)
 RUN cd /vllm-workspace \
     && python3 -m pip install -e tests/vllm_test_utils \
+    && python3 -m pip install lm-eval[api]==0.4.4 \
     && python3 -m pip install pytest-shard
 
 # enable fast downloads from hf (for testing)
