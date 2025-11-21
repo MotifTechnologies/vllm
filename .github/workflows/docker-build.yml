@@ -29,7 +29,9 @@ jobs:
       GHCR_PAT: ${{ secrets.GHCR_PAT }}
 
   build-rocm:
-    needs: compute-latest
+    needs:
+      - compute-latest
+      - build-cuda
     uses: MotifTechnologies/docker-image-ci-templates/.github/workflows/docker-build.yml@v1
     with:
       group: rocm
