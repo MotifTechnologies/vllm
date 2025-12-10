@@ -21,8 +21,6 @@ docker run --rm -it ghcr.io/MotifTechnologies/vllm:<tag>
 ```
 
 - For a full list of available images and tags, see [GHCR](https://github.com/MotifTechnologies/vllm/pkgs/container/vllm).
-- Additional images are also available on [harbor](http://192.168.5.100:40080/harbor/projects/3/repositories/vllm/artifacts-tab), hosted on the Siheung cluster.
-  - For details on using the Siheung cluster, refer to the [Siheung Cluster Guide](https://motiftech-kr-team.atlassian.net/wiki/spaces/MT/pages/70189058/TI+DC+Motif+Cluster+-+SkyPilot+User+Guide#2.-How-to-use-Harbor-Registry).
 
 ## Examples
 
