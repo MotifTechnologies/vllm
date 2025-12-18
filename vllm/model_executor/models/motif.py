@@ -14,8 +14,11 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm.attention import Attention, AttentionType
-from vllm.attention.selector import _Backend
+from vllm.attention.backends.abstract import (
+    AttentionType
+)
+from vllm.attention.backends.registry import AttentionBackendEnum
+from vllm.attention.layer import Attention
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.layernorm import PolyNorm, RMSNorm
@@ -218,7 +221,7 @@ class MotifAttention(nn.Module):
             )
         except TypeError as e:
             raise ValueError(gda_err_msg) from e
-        assert self.attn.backend == _Backend.GROUPED_DIFF_ATTN, gda_err_msg
+        assert self.attn.backend == AttentionBackendEnum.GROUPED_DIFF_ATTN, gda_err_msg
 
     def lambda_init_fn(self, depth):
         return 0.8 - 0.6 * math.exp(-0.3 * (depth - 1))
@@ -250,13 +253,18 @@ class MotifAttention(nn.Module):
         if is_gguf and config.model_type == "llama":
             is_neox_style = False
 
+        if rope_scaling is None:
+            rope_scaling = dict({})
+
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=self.max_position_embeddings,
-            base=self.rope_theta,
-            rope_scaling=rope_scaling,
             is_neox_style=is_neox_style,
+            rope_parameters={
+                **rope_scaling,
+                'rope_theta': self.rope_theta
+            },
         )
 
 

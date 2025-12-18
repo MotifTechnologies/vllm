@@ -261,7 +261,7 @@ class Attention(nn.Module, AttentionLayerBase):
         self.backend = AttentionBackendEnum.__members__.get(backend_name)
         self.dtype = dtype
 
-        if self.backend != _Backend.GROUPED_DIFF_ATTN:
+        if self.backend != AttentionBackendEnum.GROUPED_DIFF_ATTN:
             # In GDA, num_kv_heads can be different from num_heads
             assert num_heads % num_kv_heads == 0, (
                 f"num_heads ({num_heads}) is not divisible by "
