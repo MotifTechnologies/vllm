@@ -248,7 +248,11 @@ class DeviceCommunicatorBase:
         return output_tensor.movedim(0, dim).contiguous()
 
     def reduce_scatterv(
-        self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+        sizes: list[int] | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 

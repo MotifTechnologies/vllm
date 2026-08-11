@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import Any
 
 import torch
@@ -20,6 +21,7 @@ from vllm.v1.worker.gpu.attn_utils import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import (
+    BatchExecutionDescriptor,
     get_uniform_token_count,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
@@ -64,6 +66,10 @@ class EagleSpeculator:
         # DP configuration
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+
+        # MOTIF: set in load_model(); when True, draft passes skip the
+        # per-pass cross-DP batch coordination (dense drafter, no collectives).
+        self.skip_dp_coordination = False
 
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
@@ -156,6 +162,90 @@ class EagleSpeculator:
         self.draft_attn_layer_names = set(all_attn_layers) - set(
             target_attn_layer_names
         )
+
+        self.skip_dp_coordination = self._should_skip_dp_coordination()
+
+    def _should_skip_dp_coordination(self) -> bool:
+        """MOTIF: whether draft passes can skip cross-DP batch coordination.
+
+        True only for dense drafters (no cross-rank collectives in the draft
+        forward). The decision must be identical on every DP rank; it depends
+        only on the draft model architecture and a process-wide env toggle.
+        """
+        if self.dp_size <= 1:
+            return False
+        if os.environ.get("MOTIF_DRAFT_SKIP_DP_COORD", "1") != "1":
+            logger.info_once(
+                "MOTIF_DRAFT_SKIP_DP_COORD=0: keeping per-pass DP batch "
+                "coordination in the drafter."
+            )
+            return False
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
+        # Conservative scan: any FusedMoE instance or MoE-looking wrapper
+        # keeps the coordination.
+        moe_like = {
+            type(m).__name__
+            for m in self.model.modules()
+            if isinstance(m, FusedMoE) or "MoE" in type(m).__name__
+        }
+        if moe_like:
+            logger.info_once(
+                "Draft model contains MoE-like modules (%s); keeping per-pass "
+                "DP batch coordination in the drafter.",
+                sorted(moe_like),
+            )
+            return False
+        logger.info_once(
+            "Draft model has no MoE layers: skipping per-pass DP batch "
+            "coordination in the drafter (saves 1-2 rendezvous per step; "
+            "set MOTIF_DRAFT_SKIP_DP_COORD=0 to disable)."
+        )
+        return True
+
+    def _dispatch_cg_and_maybe_sync_dp(
+        self,
+        cudagraph_manager: EagleCudaGraphManager | None,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        need_eager: bool,
+    ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
+        """MOTIF: dispatch_cg_and_sync_dp minus the cross-rank rendezvous.
+
+        With skip_dp_coordination, dispatch locally and fabricate the
+        DP-metadata tensor: set_forward_context re-runs its own coordination
+        when handed None with dp_size > 1, and DPMetadata asserts
+        [dp_rank] == num_tokens, so a locally filled tensor is required.
+        """
+        if not (self.dp_size > 1 and self.skip_dp_coordination):
+            return dispatch_cg_and_sync_dp(
+                cudagraph_manager,
+                num_reqs,
+                num_tokens,
+                uniform_token_count,
+                dp_size=self.dp_size,
+                dp_rank=self.dp_rank,
+                need_eager=need_eager,
+            )
+        if need_eager:
+            batch_desc = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+            )
+        else:
+            assert cudagraph_manager is not None
+            batch_desc = cudagraph_manager.dispatch(
+                num_reqs, num_tokens, uniform_token_count
+            )
+        num_tokens_across_dp = torch.full(
+            (self.dp_size,),
+            batch_desc.num_tokens,
+            dtype=torch.int32,
+            device="cpu",
+        )
+        return batch_desc, num_tokens_across_dp
 
     def set_attn(
         self,
@@ -464,13 +554,11 @@ class EagleSpeculator:
         # When all requests are decoding (no true prefills), each has
         # num_speculative_steps + 1 tokens, enabling FULL graph replay.
         # Mixed or prefill-only batches fall back to PIECEWISE.
-        prefill_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+        prefill_batch_desc, num_tokens_across_dp = self._dispatch_cg_and_maybe_sync_dp(
             self.prefill_cudagraph_manager,
             num_reqs,
             num_tokens,
             get_uniform_token_count(num_reqs, num_tokens, max_query_len),
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
             need_eager=is_profile,
         )
 
@@ -517,13 +605,11 @@ class EagleSpeculator:
 
         # Each request produces exactly 1 token per draft generation step,
         # enabling FULL graph replay.
-        decode_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+        decode_batch_desc, num_tokens_across_dp = self._dispatch_cg_and_maybe_sync_dp(
             self.decode_cudagraph_manager,
             num_reqs,
             num_reqs,
             uniform_token_count=1,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
             need_eager=is_profile,
         )
 

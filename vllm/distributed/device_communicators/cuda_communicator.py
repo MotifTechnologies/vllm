@@ -256,7 +256,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return output.movedim(0, dim).contiguous()
 
     def reduce_scatterv(
-        self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+        sizes: list[int] | None = None,
+        out: torch.Tensor | None = None,
     ):
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
@@ -278,15 +282,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
             chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
-        output = torch.empty(
-            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-        )
+        if out is not None:
+            # Destination-passing: the collective writes straight into the
+            # caller's buffer, skipping the allocate+copy round-trip. Only
+            # supported for dim=0 (no movedim un-permute on the way out).
+            assert dim == 0, "reduce_scatterv(out=...) requires dim=0"
+            assert out.shape == output_shape and out.dtype == input_tensor.dtype
+            assert out.is_contiguous()
+            output = out
+        else:
+            output = torch.empty(
+                output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+            )
 
         if sizes is not None and sizes.count(sizes[0]) != len(sizes):
             pynccl_comm.reduce_scatterv(output, input_tensor, sizes=sizes)
         else:
             pynccl_comm.reduce_scatter(output, input_tensor)
 
+        if out is not None:
+            return out
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
 

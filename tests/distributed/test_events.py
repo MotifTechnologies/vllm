@@ -312,3 +312,81 @@ def test_event_publisher_factory():
     publisher = EventPublisherFactory.create(config, DP_RANK)
     assert isinstance(publisher, ZmqEventPublisher)
     publisher.shutdown()
+
+
+def test_render_topic_placeholders(monkeypatch):
+    """`_render_topic` substitutes per-rank placeholders so each DP rank
+    publishes under a distinct, routable topic. This is what lets a
+    topic-attributing consumer (llm-d endpoint-picker in precise mode) map a
+    KV stream back to one rank of a multi-port external-LB deployment."""
+    from vllm.distributed.kv_events import ZmqEventPublisher as Z
+
+    # No placeholder -> unchanged (default / approx-mode / non-DP behaviour).
+    monkeypatch.delenv("VLLM_KV_EVENTS_ENDPOINT_PORT", raising=False)
+    assert Z._render_topic("kv@1.2.3.4@motif", 5) == "kv@1.2.3.4@motif"
+    assert Z._render_topic("", 5) == ""
+
+    # {dp_rank} -> the global data-parallel rank (no env needed).
+    assert Z._render_topic("kv@1.2.3.4-dp{dp_rank}@motif", 3) == "kv@1.2.3.4-dp3@motif"
+
+    # {port} -> the routable API port from VLLM_KV_EVENTS_ENDPOINT_PORT.
+    monkeypatch.setenv("VLLM_KV_EVENTS_ENDPOINT_PORT", "8203")
+    assert Z._render_topic("kv@1.2.3.4:{port}@motif", 3) == "kv@1.2.3.4:8203@motif"
+    assert Z._render_topic("kv@1.2.3.4:{port}@m-dp{dp_rank}", 3) == (
+        "kv@1.2.3.4:8203@m-dp3"
+    )
+
+    # {port} referenced but env unset -> substituted empty (visibly degraded).
+    monkeypatch.delenv("VLLM_KV_EVENTS_ENDPOINT_PORT", raising=False)
+    assert Z._render_topic("kv@1.2.3.4:{port}@motif", 3) == "kv@1.2.3.4:@motif"
+
+
+def test_per_rank_topic_isolation(publisher_config):
+    """End-to-end: each DP rank publishes under its own topic, and a consumer
+    connected to ALL rank sockets (as it would be behind a fan-in proxy)
+    isolates a single rank purely by subscribing to that rank's topic."""
+    from vllm.distributed.kv_events import ZmqEventPublisher
+
+    from .conftest import MockSubscriber
+
+    n_ranks = 3
+    publisher_config.replay_endpoint = None
+    publisher_config.topic = "kv@10.0.0.5-dp{dp_rank}@motif"
+    base_ep = publisher_config.endpoint  # inproc://test-<port>
+
+    # One publisher per rank; each auto-offsets its own endpoint by rank.
+    pubs = [EventPublisherFactory.create(publisher_config, r) for r in range(n_ranks)]
+    endpoints = [
+        ZmqEventPublisher.offset_endpoint_port(base_ep, r) for r in range(n_ranks)
+    ]
+    per_rank_topic = [f"kv@10.0.0.5-dp{r}@motif" for r in range(n_ranks)]
+
+    # Each subscriber connects to *every* rank socket (fan-in) but filters on
+    # one rank's topic — proving topic-only attribution on a shared stream.
+    subs = [MockSubscriber(endpoints, None, per_rank_topic[r]) for r in range(n_ranks)]
+
+    try:
+        time.sleep(0.2)  # let PUB sockets bind before publishing
+
+        # Rank r emits (r+1) events so content routing is checkable too.
+        for r in range(n_ranks):
+            pubs[r].publish(create_test_events(r + 1))
+
+        for r in range(n_ranks):
+            got = subs[r].receive_one(timeout=500)
+            assert got is not None, f"rank {r} subscriber received nothing"
+            _, batch = got
+            assert batch.data_parallel_rank == r, (
+                f"topic {per_rank_topic[r]} delivered rank "
+                f"{batch.data_parallel_rank}, expected {r}"
+            )
+            assert len(batch.events) == r + 1, f"wrong event count for rank {r}"
+            # Nothing else should match this rank's topic (no cross-rank leak).
+            assert subs[r].receive_one(timeout=100) is None, (
+                f"rank {r} subscriber saw cross-rank traffic"
+            )
+    finally:
+        for p in pubs:
+            p.shutdown()
+        for s in subs:
+            s.close()

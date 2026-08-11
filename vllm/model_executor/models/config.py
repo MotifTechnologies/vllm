@@ -132,6 +132,36 @@ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
                 )
 
 
+class MotifForCausalLMConfig(VerifyAndUpdateConfig):
+    """
+    Derive ``qk_nope_head_dim`` on the HF config after loading.
+
+    Motif checkpoints are loaded via ``trust_remote_code`` with the
+    ``configuration_motif.py`` bundled in the checkpoint directory, not the
+    copy in ``vllm/transformers_utils/configs/motif.py``. That bundled config
+    only stores ``head_dim``, ``qk_rope_head_dim``, ``v_head_dim`` —
+    ``qk_nope_head_dim`` is derived. vLLM's ``get_mla_dims`` reads
+    ``hf_text_config.qk_nope_head_dim`` directly without a default, so we
+    must inject the derived value here for the MLA hybrid layers to work.
+    """
+
+    @staticmethod
+    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        hf_config = model_config.hf_config
+        if hasattr(hf_config, "qk_nope_head_dim"):
+            return
+        head_dim = getattr(hf_config, "head_dim", None)
+        if head_dim is None:
+            return
+        qk_rope_head_dim = getattr(hf_config, "qk_rope_head_dim", None)
+        if qk_rope_head_dim is None:
+            qk_rope_head_dim = head_dim // 2
+            hf_config.qk_rope_head_dim = qk_rope_head_dim
+        hf_config.qk_nope_head_dim = head_dim - qk_rope_head_dim
+        if getattr(hf_config, "v_head_dim", None) is None:
+            hf_config.v_head_dim = head_dim
+
+
 class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -680,6 +710,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "LlamaNemotronVLModel": LlamaNemotronVLConfig,
     "Mamba2ForCausalLM": MambaModelConfig,
     "MambaForCausalLM": MambaModelConfig,
+    "MotifForCausalLM": MotifForCausalLMConfig,
     "NemotronHForCausalLM": NemotronHForCausalLMConfig,
     "NemotronHPuzzleForCausalLM": NemotronHForCausalLMConfig,
     "NemotronH_Nano_VL_V2": NemotronHNanoVLV2Config,

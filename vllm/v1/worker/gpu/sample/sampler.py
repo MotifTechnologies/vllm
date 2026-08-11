@@ -16,6 +16,7 @@ from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
+from vllm.v1.worker.gpu.sample.think_budget import ThinkBudgetState
 from vllm.v1.worker.gpu.states import RequestState
 
 
@@ -28,6 +29,7 @@ class Sampler:
         req_states: RequestState,
         logprobs_mode: LogprobsMode = "raw_logprobs",
         num_speculative_tokens: int = 1,
+        vllm_config=None,
     ):
         if logprobs_mode not in ("processed_logprobs", "raw_logprobs"):
             raise NotImplementedError(f"Unsupported logprobs_mode: {logprobs_mode}")
@@ -38,21 +40,36 @@ class Sampler:
         self.penalties_state = PenaltiesState(req_states)
         self.logit_bias_state = LogitBiasState(max_num_reqs, device)
         self.bad_words_state = BadWordsState(req_states)
+        # MOTIF: thinking-token-budget enforcement (V2 port of the V1
+        # ThinkingTokenBudgetLogitsProcessor). None when no config is given.
+        self.think_budget_state = (
+            ThinkBudgetState(vllm_config, device) if vllm_config is not None else None
+        )
         self.num_speculative_tokens = num_speculative_tokens
 
     def add_request(
-        self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
+        self,
+        req_idx: int,
+        prompt_len: int,
+        sampling_params: SamplingParams,
+        prompt_token_ids: list[int] | None = None,
     ) -> None:
         self.sampling_states.add_request(req_idx, sampling_params)
         self.penalties_state.add_request(req_idx, sampling_params)
         self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
         self.bad_words_state.add_request(req_idx, sampling_params)
+        if self.think_budget_state is not None:
+            self.think_budget_state.add_request(
+                req_idx, prompt_len, sampling_params, prompt_token_ids
+            )
 
     def apply_staged_writes(self) -> None:
         self.sampling_states.apply_staged_writes()
         self.penalties_state.apply_staged_writes()
         self.logit_bias_state.apply_staged_writes()
         self.bad_words_state.apply_staged_writes()
+        if self.think_budget_state is not None:
+            self.think_budget_state.apply_staged_writes()
 
     def __call__(
         self,
@@ -147,9 +164,21 @@ class Sampler:
         self.sampling_states.apply_min_p(logits, expanded_idx_mapping, idx_mapping_np)
 
         # Apply top_k and/or top_p. This might or might not return a new tensor.
-        return self.sampling_states.apply_top_k_top_p(
+        logits = self.sampling_states.apply_top_k_top_p(
             logits, expanded_idx_mapping, idx_mapping_np
         )
+
+        # MOTIF: think-budget forcing runs LAST so the forced token survives
+        # every filter above.
+        if self.think_budget_state is not None:
+            self.think_budget_state.apply(
+                logits,
+                expanded_idx_mapping,
+                idx_mapping_np,
+                input_ids,
+                expanded_local_pos,
+            )
+        return logits
 
     def sample(
         self,

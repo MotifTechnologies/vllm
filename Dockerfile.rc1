@@ -1,0 +1,194 @@
+# syntax=docker/dockerfile:1.7
+# ---------------------------------------------------------------------------
+# motif3 vLLM serving image — motif3-v0.20.2.rc1 (vLLM baked in)
+#
+# Build context must be a checkout of motif3-v0.20.2.rc1 INCLUDING .git —
+# setup.py brands the wheel from the newest motif3-* tag + HEAD sha
+# (-> 0.20.2+motif3.g<sha>.cu131).
+#
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.rc1 \
+#       -t motif-vllm:v0.20.2-motif3.rc1 .
+#
+# TORCH_CUDA_ARCH_LIST is 9.0 + 10.0 ONLY (H100/H200 + B200), deliberately:
+#   * modelopt_blockfp8 MoE (the deployment quant path) hard-asserts SM90+
+#     (MotifDeepGemmMoEMethod) and deep_gemm ships kernels only for SM90
+#     (1d2d) / SM100 (1d1d) — no SM8x, no SM12x.
+#   * The MLA backends motif3 actually uses are arch-pinned: FLASH_ATTN_MLA
+#     (FA3) = SM90, CUTLASS_MLA / flashinfer cute-dsl = SM100.
+#   * DeepEP hybrid-ep below is likewise built for 9.0;10.0 only.
+#   The bf16 Triton fallback might import on SM80, but it is unvalidated and
+#   none of the serving stack applies there — not worth 2x build time/size.
+# ---------------------------------------------------------------------------
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.02-py3
+
+# --------------------------- stage 1: vLLM wheel ---------------------------
+FROM ${BASE_IMAGE} AS vllm-builder
+
+# setup.py runs ninja with MAX_JOBS/NVCC_THREADS parallel jobs, so the
+# effective job count here is 96/2 = 48 (fits 96 cores / ~450GB free RAM).
+ARG MAX_JOBS=96
+ARG NVCC_THREADS=2
+
+# The NVIDIA base image pins pip + torch via these vars; clear them so our installs win.
+ENV PIP_CONSTRAINT="" \
+    PYTORCH_VERSION="" \
+    PYTORCH_HOME="" \
+    PYTORCH_BUILD_VERSION="" \
+    DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1
+
+# Same header/link fixes as the runtime stage (CUDA 13 relocated CCCL headers,
+# stub libnvidia-ml for linking without a driver).
+RUN ln -sf /usr/local/cuda/lib64/stubs/libnvidia-ml.so /usr/local/cuda/lib64/stubs/libnvidia-ml.so.1
+ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} \
+    CPATH=/usr/local/cuda/targets/x86_64-linux/include/cccl:/usr/include/c++/11:/usr/include/x86_64-linux-gnu/c++/11 \
+    CPLUS_INCLUDE_PATH=/usr/local/cuda/targets/x86_64-linux/include/cccl:/usr/include/c++/11:/usr/include/x86_64-linux-gnu/c++/11
+
+# Match the runtime torch exactly (also pinned in requirements/build/cuda.txt).
+RUN pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+
+COPY . /src
+WORKDIR /src
+
+RUN pip install -r requirements/build/cuda.txt
+
+# ccache (auto-detected by vLLM's CMake) + the cache mount below make
+# interrupted/repeated builds resume instead of recompiling from scratch.
+RUN apt-get update -y && apt-get install -y --no-install-recommends ccache && \
+    rm -rf /var/lib/apt/lists/*
+ENV CCACHE_DIR=/root/.cache/ccache \
+    CCACHE_MAXSIZE=30G
+
+ENV TORCH_CUDA_ARCH_LIST="9.0 10.0" \
+    VLLM_TARGET_DEVICE=cuda \
+    MAX_JOBS=${MAX_JOBS} \
+    NVCC_THREADS=${NVCC_THREADS}
+
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    --mount=type=cache,target=/root/.cache/pip \
+    python -m build --wheel --no-isolation -o /wheels . && ls -la /wheels
+
+# --------------------------- stage 2: serving image ------------------------
+FROM ${BASE_IMAGE}
+
+ARG MAX_JOBS=32
+
+ENV PIP_CONSTRAINT="" \
+    PYTORCH_VERSION="" \
+    PYTORCH_HOME="" \
+    PYTORCH_BUILD_VERSION="" \
+    DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1
+
+# --- system RDMA libs + symlinks (per team Dockerfile) ---
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        git rsync libpopt-dev libibverbs-dev librdmacm-dev rdma-core libmlx5-1 infiniband-diags && \
+    ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1    /usr/lib/x86_64-linux-gnu/libmlx5.so && \
+    ln -sf /usr/lib/x86_64-linux-gnu/libibverbs.so.1 /usr/lib/x86_64-linux-gnu/libibverbs.so && \
+    ln -sf /usr/local/cuda/lib64/stubs/libnvidia-ml.so /usr/local/cuda/lib64/stubs/libnvidia-ml.so.1 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip install ninja pynvml
+
+# --- NVSHMEM 3.3.9 ---
+ENV NVSHMEM_DIR=/usr/local/nvshmem
+RUN curl -fSL https://developer.download.nvidia.com/compute/nvshmem/redist/libnvshmem/linux-x86_64/libnvshmem-linux-x86_64-3.3.9_cuda12-archive.tar.xz \
+        -o /tmp/nvshmem.tar.xz && \
+    mkdir -p ${NVSHMEM_DIR} && \
+    tar -xf /tmp/nvshmem.tar.xz -C ${NVSHMEM_DIR} --strip-components=1 && \
+    rm /tmp/nvshmem.tar.xz
+
+# Build- and run-time search paths.
+#   LIBRARY_PATH : link against the CUDA stub libnvidia-ml at build time
+#   CPATH        : CCCL (libcu++) headers relocated under cuda/std on CUDA 13.x
+ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} \
+    LD_LIBRARY_PATH=${NVSHMEM_DIR}/lib:${LD_LIBRARY_PATH} \
+    PATH=${NVSHMEM_DIR}/bin:${PATH} \
+    CPATH=/usr/local/cuda/targets/x86_64-linux/include/cccl:/usr/include/c++/11:/usr/include/x86_64-linux-gnu/c++/11 \
+    CPLUS_INCLUDE_PATH=/usr/local/cuda/targets/x86_64-linux/include/cccl:/usr/include/c++/11:/usr/include/x86_64-linux-gnu/c++/11
+
+# --- python deps (same validated set as the YAML setup) ---
+RUN pip install --ignore-installed PyJWT && \
+    pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+
+RUN --mount=type=bind,source=requirements/common.txt,target=/tmp/common.txt \
+    pip install -r /tmp/common.txt
+
+RUN pip install -U "transformers>=5.0,<6" && \
+    pip install "kernels==0.14.1" "tilelang==0.1.9" "apache-tvm-ffi==0.1.9" "fastapi[standard]==0.116.1"
+
+# ─── DeepEP hybrid-ep (H200 SM90 / B200 SM100, inter-node enabled) ───
+RUN git clone --branch hybrid-ep --recurse-submodules \
+        https://github.com/MotifTechnologies/DeepEP.git /tmp/deep_ep && \
+    cd /tmp/deep_ep && \
+    git checkout 9ce044d && \
+    git submodule update --init --recursive && \
+    TORCH_CUDA_ARCH_LIST="9.0;10.0" \
+    NVSHMEM_DIR=${NVSHMEM_DIR} \
+    HYBRID_EP_MULTINODE=1 \
+    RDMA_CORE_HOME=/usr \
+    MAX_JOBS=${MAX_JOBS} \
+    python setup.py install && \
+    rm -rf /tmp/deep_ep
+# Note: `import deep_ep` is NOT verified here — it needs libcuda.so.1 from the
+# GPU driver, which is only injected at runtime. The check runs in the entrypoint.
+
+# ─── Flash Attention (Motif fork) + FA4 cute-dsl ───
+# Same pin as docker/cuda/llm-training.Dockerfile so serving matches training.
+# vLLM falls back to the standalone `flash_attn` package in a few paths
+# (fa_utils, mla_attention, rotary triton); FA4 lives in the cute subpackage.
+RUN git clone https://github.com/MotifTechnologies/flash-attention.git /tmp/flash-attention && \
+    cd /tmp/flash-attention && \
+    git checkout c4fa1d1223e9f906382ae61485aeb3798d7e6566 && \
+    TORCH_CUDA_ARCH_LIST="9.0;10.0" MAX_JOBS=${MAX_JOBS} \
+        pip install --no-build-isolation . && \
+    cd flash_attn/cute && \
+    pip install --no-build-isolation . && \
+    rm -rf /tmp/flash-attention
+
+# ─── vLLM motif3-v0.20.2.rc1 wheel (built in stage 1) ───
+# --no-deps --force-reinstall mirrors the validated YAML flow: the dep set
+# above is the tested one; don't let pip resolve it differently.
+RUN --mount=type=bind,from=vllm-builder,source=/wheels,target=/tmp/wheels \
+    pip install --no-deps --force-reinstall /tmp/wheels/vllm-*.whl && \
+    python -c "import vllm; print('[build] vllm', vllm.__version__)"
+
+# flashinfer: FLASHINFER_MLA cute-dsl backend (SM100 MTP spec decode) + the
+# opt-in top-k/top-p sampler (VLLM_USE_FLASHINFER_SAMPLER=1).
+# cutlass-dsl 4.5.2 / flashinfer 0.6.13 are installed --no-deps so they don't
+# drag their own torch/cutlass resolution over the pinned stack; cu13 libs are
+# optional (|| true) because they are absent on some index mirrors.
+RUN pip install --no-deps nvidia-cutlass-dsl==4.5.2 nvidia-cutlass-dsl-libs-base==4.5.2 && \
+    (pip install --no-deps nvidia-cutlass-dsl-libs-cu13==4.5.2 2>/dev/null || true) && \
+    pip install --no-deps flashinfer-python==0.6.13 flashinfer-cubin==0.6.13 && \
+    pip install --no-deps cuda-tile
+
+# --- runtime config (stable env from the YAML; secrets stay out of the image) ---
+ENV VLLM_THINK_BUDGET_RATIO=0.8 \
+    MOTIF_THINK_BUDGET_FORCE_STR="I have to give the solution based on the reasoning directly now.</think>" \
+    VLLM_USE_FLASHINFER_SAMPLER=1 \
+    VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    VLLM_ENGINE_READY_TIMEOUT_S=1200 \
+    VLLM_HYBRID_SWA_NUM_SUBGROUPS=13 \
+    HF_HOME=/lustrefs/team-service/cache/hf \
+    VLLM_CACHE_ROOT=/lustrefs/team-service/cache/vllm \
+    TRITON_CACHE_DIR=/lustrefs/team-service/cache/triton \
+    TORCHINDUCTOR_CACHE_DIR=/lustrefs/team-service/cache/inductor \
+    TILELANG_CACHE_DIR=/lustrefs/team-service/cache/tilelang
+
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+# No default CMD: the model path, quantization and speculative config differ per
+# deployment, so the image takes the full `vllm serve ...` line as arguments.
+# The entrypoint runs its preflight and then execs whatever it is given.
+#
+#   docker run --gpus all -e VLLM_API_KEY=... <image> \
+#       vllm serve <ckpt> --served-model-name motif --trust-remote-code ...
+#
+# (VLLM_API_KEY stays an env var so it is never baked into a layer.)

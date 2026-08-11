@@ -965,6 +965,22 @@ class VllmConfig:
 
         default_config = OPTIMIZATION_LEVEL_TO_CONFIG[self.optimization_level]
         self._apply_optimization_level_defaults(default_config)
+
+        if (
+            self.model_config is not None
+            and getattr(self.model_config.hf_config, "model_type", "") == "Motif"
+            and self.speculative_config is None
+            and self.compilation_config.cudagraph_mode is not None
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        ):
+            logger.warning(
+                "Motif without speculative decoding does not support FULL "
+                "cudagraphs (decode-step logit corruption); downgrading "
+                "cudagraph_mode %s -> PIECEWISE.",
+                self.compilation_config.cudagraph_mode.name,
+            )
+            self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
         if self.kernel_config.enable_flashinfer_autotune is None:
             raise ValueError(
                 "KernelConfig.enable_flashinfer_autotune must be set after applying "

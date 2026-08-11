@@ -62,8 +62,15 @@ def mhc_pre_big_fuse_tilelang(
     sinkhorn_repeat: int,
     n_splits: int = 16,
     hc_mult: int = 4,
+    motif_sinkhorn: int = 0,
 ):
-    """Deeply fused kernels, everything other than gemm & sqrsum in mHC pre block."""
+    """Deeply fused kernels, everything other than gemm & sqrsum in mHC pre block.
+
+    motif_sinkhorn=1: Motif's training sinkhorn convention — exp(clamp(M, +-20))
+    init (saturates |M|>20, unlike softmax) with clamp-min(eps) denominators —
+    and comb_mix is stored TRANSPOSED so the consumer's comb^T application
+    yields sinkhorn(M) directly.
+    """
     num_tokens = T.dynamic("num_tokens")
     hc_mult3 = hc_mult * (2 + hc_mult)
     hidden_block = math.gcd(512, hidden_size)
@@ -104,7 +111,17 @@ def mhc_pre_big_fuse_tilelang(
             for j in T.Parallel(hc_mult):
                 post_mix[i, j] = (
                     T.sigmoid(
-                        mixes_shared[j + hc_mult] * hc_scale[1] + hc_base[j + hc_mult]
+                        # Clamp pre-sigmoid to [-10, 10] to match the eager /
+                        # Triton path and training (sigmoid saturates beyond
+                        # this; the clamp only guards the deep-saturation tail).
+                        T.max(
+                            T.min(
+                                mixes_shared[j + hc_mult] * hc_scale[1]
+                                + hc_base[j + hc_mult],
+                                10.0,
+                            ),
+                            -10.0,
+                        )
                     )
                     * hc_post_mult_value
                 )
@@ -119,34 +136,52 @@ def mhc_pre_big_fuse_tilelang(
             row_sum = T.alloc_fragment(hc_mult, T.float32)
             col_sum = T.alloc_fragment(hc_mult, T.float32)
 
-            # comb = comb.softmax(-1) + eps
-            row_max = T.alloc_fragment(hc_mult, T.float32)
-            T.reduce_max(cm, row_max, dim=1)
-            for j, k in T.Parallel(hc_mult, hc_mult):
-                cm[j, k] = T.exp(cm[j, k] - row_max[j])
-            T.reduce_sum(cm, row_sum, dim=1)
-            for j, k in T.Parallel(hc_mult, hc_mult):
-                cm[j, k] = cm[j, k] / row_sum[j] + hc_sinkhorn_eps
-
-            # comb = comb / (comb.sum(-2) + eps)
-            T.reduce_sum(cm, col_sum, dim=0)
-            for j, k in T.Parallel(hc_mult, hc_mult):
-                cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
-
-            for _ in T.serial(sinkhorn_repeat - 1):
-                # comb = comb / (comb.sum(-1) + eps)
+            if motif_sinkhorn:
+                # Matches motif_mhc_kernels.sinkhorn_fused: exp(clamp(M, +-20))
+                # init, K x (row, col) norms with clamp-min(eps) denominators.
+                for j, k in T.Parallel(hc_mult, hc_mult):
+                    cm[j, k] = T.exp(T.max(T.min(cm[j, k], 20.0), -20.0))
+                for _ in T.serial(sinkhorn_repeat):
+                    T.reduce_sum(cm, row_sum, dim=1)
+                    for j, k in T.Parallel(hc_mult, hc_mult):
+                        cm[j, k] = cm[j, k] / T.max(row_sum[j], hc_sinkhorn_eps)
+                    T.reduce_sum(cm, col_sum, dim=0)
+                    for j, k in T.Parallel(hc_mult, hc_mult):
+                        cm[j, k] = cm[j, k] / T.max(col_sum[k], hc_sinkhorn_eps)
+            else:
+                # comb = comb.softmax(-1) + eps
+                row_max = T.alloc_fragment(hc_mult, T.float32)
+                T.reduce_max(cm, row_max, dim=1)
+                for j, k in T.Parallel(hc_mult, hc_mult):
+                    cm[j, k] = T.exp(cm[j, k] - row_max[j])
                 T.reduce_sum(cm, row_sum, dim=1)
                 for j, k in T.Parallel(hc_mult, hc_mult):
-                    cm[j, k] = cm[j, k] / (row_sum[j] + hc_sinkhorn_eps)
+                    cm[j, k] = cm[j, k] / row_sum[j] + hc_sinkhorn_eps
 
                 # comb = comb / (comb.sum(-2) + eps)
                 T.reduce_sum(cm, col_sum, dim=0)
                 for j, k in T.Parallel(hc_mult, hc_mult):
                     cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
 
-            # save comb_mix to global memory
-            for j, k in T.Parallel(hc_mult, hc_mult):
-                comb_mix[i, j * hc_mult + k] = cm[j, k]
+                for _ in T.serial(sinkhorn_repeat - 1):
+                    # comb = comb / (comb.sum(-1) + eps)
+                    T.reduce_sum(cm, row_sum, dim=1)
+                    for j, k in T.Parallel(hc_mult, hc_mult):
+                        cm[j, k] = cm[j, k] / (row_sum[j] + hc_sinkhorn_eps)
+
+                    # comb = comb / (comb.sum(-2) + eps)
+                    T.reduce_sum(cm, col_sum, dim=0)
+                    for j, k in T.Parallel(hc_mult, hc_mult):
+                        cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
+
+            # save comb_mix to global memory (motif: transposed, so applying
+            # comb^T downstream yields sinkhorn(M) like the Triton path)
+            if motif_sinkhorn:
+                for j, k in T.Parallel(hc_mult, hc_mult):
+                    comb_mix[i, k * hc_mult + j] = cm[j, k]
+            else:
+                for j, k in T.Parallel(hc_mult, hc_mult):
+                    comb_mix[i, j * hc_mult + k] = cm[j, k]
         else:
             ##################################################################
             # _pre_split_mixes_fwd (pre)
@@ -154,7 +189,15 @@ def mhc_pre_big_fuse_tilelang(
             for j in T.Parallel(hc_mult):
                 pre_mix_shared[j] = (
                     T.sigmoid(
-                        mixes_shared[j] * hc_scale[0] + hc_base[j],
+                        # Clamp pre-sigmoid to [-10, 10] to match the eager /
+                        # Triton path and training (saturates beyond this range).
+                        T.max(
+                            T.min(
+                                mixes_shared[j] * hc_scale[0] + hc_base[j],
+                                10.0,
+                            ),
+                            -10.0,
+                        ),
                     )
                     + hc_pre_eps
                 )
@@ -189,6 +232,7 @@ def mhc_pre(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     n_splits: int = 1,
+    motif_sinkhorn: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward pass for mHC pre block.
@@ -299,6 +343,7 @@ def mhc_pre(
         sinkhorn_repeat,
         n_splits,
         hc_mult,
+        motif_sinkhorn,
     )
 
     post_mix = post_mix.view(*outer_shape, hc_mult, 1)
@@ -319,6 +364,7 @@ def _mhc_pre_fake(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     n_splits: int = 1,
+    motif_sinkhorn: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]

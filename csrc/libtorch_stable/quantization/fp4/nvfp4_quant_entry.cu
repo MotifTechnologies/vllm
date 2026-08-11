@@ -38,6 +38,15 @@ void scaled_fp4_experts_quant_sm1xxa(
     torch::stable::Tensor const& input_global_scale,
     torch::stable::Tensor const& input_offset_by_experts,
     torch::stable::Tensor const& output_scale_offset_by_experts);
+
+void scaled_fp4_experts_quant_permuted_sm1xxa(
+    torch::stable::Tensor& output, torch::stable::Tensor& output_scale,
+    torch::stable::Tensor const& input,
+    torch::stable::Tensor const& input_global_scale,
+    torch::stable::Tensor const& input_offset_by_experts,
+    torch::stable::Tensor const& output_scale_offset_by_experts,
+    torch::stable::Tensor const& permuted_idx,
+    torch::stable::Tensor& inv_permuted_idx, int64_t topk);
 #endif
 
 #if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
@@ -135,6 +144,29 @@ void scaled_fp4_experts_quant(
 #endif
   STD_TORCH_CHECK_NOT_IMPLEMENTED(
       false, "No compiled nvfp4 experts quantization kernel");
+}
+
+void scaled_fp4_experts_quant_permuted(
+    torch::stable::Tensor& output, torch::stable::Tensor& output_scale,
+    torch::stable::Tensor const& input,
+    torch::stable::Tensor const& input_global_scale,
+    torch::stable::Tensor const& input_offset_by_experts,
+    torch::stable::Tensor const& output_scale_offset_by_experts,
+    torch::stable::Tensor const& permuted_idx,
+    torch::stable::Tensor& inv_permuted_idx, int64_t topk) {
+#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
+    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+  STD_TORCH_CHECK(nvfp4_quant_sm_supported(),
+                  "No compiled permuted nvfp4 experts quantization kernel "
+                  "for SM ",
+                  get_sm_version_num(),
+                  ". Recompile with the appropriate CUDA arch.");
+  return scaled_fp4_experts_quant_permuted_sm1xxa(
+      output, output_scale, input, input_global_scale, input_offset_by_experts,
+      output_scale_offset_by_experts, permuted_idx, inv_permuted_idx, topk);
+#endif
+  STD_TORCH_CHECK_NOT_IMPLEMENTED(
+      false, "No compiled permuted nvfp4 experts quantization kernel");
 }
 
 void silu_and_mul_nvfp4_quant(torch::stable::Tensor& output,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any
 
@@ -735,6 +736,85 @@ class ModelOptFp8PbWoLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        return self.w8a8_block_fp8_linear.apply_weights(layer, x, bias)
+
+
+class MotifDynamicBlockFp8LinearMethod(ModelOptFp8PbWoLinearMethod):
+    """Load-time block-FP8 linear for bf16 checkpoints (modelopt_blockfp8
+    dynamic mode).
+
+    Same execution recipe as FP8_PB_WO (weight 128x128 static block scales +
+    per-token-group 1x128 dynamic activation quant), but the checkpoint is
+    bf16: weights load unquantized and are block-cast to fp8 in
+    process_weights_after_loading. Layers whose partition dims are not
+    divisible by 128 silently stay bf16 (plain F.linear)."""
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        del input_size, output_size
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        block_n, block_k = self._WEIGHT_BLOCK_SIZE
+        self._quantize_ok = (
+            output_size_per_partition % block_n == 0
+            and input_size_per_partition % block_k == 0
+        )
+        layer.weight_block_size = (
+            self.weight_block_size if self._quantize_ok else None
+        )
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition,
+                dtype=params_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not self._quantize_ok:
+            layer.weight = Parameter(layer.weight.data, requires_grad=False)
+            return
+        from vllm.utils.deep_gemm import per_block_cast_to_fp8
+
+        q, s = per_block_cast_to_fp8(
+            layer.weight.data,
+            block_size=list(self._WEIGHT_BLOCK_SIZE),
+            use_ue8m0=False,
+        )
+        layer.weight = Parameter(q, requires_grad=False)
+        layer.weight_scale = Parameter(s.contiguous(), requires_grad=False)
+        self.w8a8_block_fp8_linear = init_fp8_linear_kernel(
+            activation_quant_key=self.activation_quant_key,
+            weight_quant_key=self.weight_quant_key,
+            weight_shape=layer.weight.shape,
+            input_dtype=self.input_dtype,
+            out_dtype=self.out_dtype,
+            module_name=self.__class__.__name__,
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self._quantize_ok:
+            return torch.nn.functional.linear(x, layer.weight, bias)
         return self.w8a8_block_fp8_linear.apply_weights(layer, x, bias)
 
 
@@ -1503,16 +1583,18 @@ class ModelOptMxFp8Config(ModelOptQuantConfigBase):
         super().__init__(exclude_modules)
         self.is_checkpoint_mxfp8_serialized = is_checkpoint_mxfp8_serialized
 
-        if not is_checkpoint_mxfp8_serialized:
-            raise ValueError(
-                "MXFP8 quantization requires a serialized checkpoint. "
-                "Dynamic quantization is not supported."
+        if is_checkpoint_mxfp8_serialized:
+            logger.warning(
+                "Detected ModelOpt MXFP8 checkpoint. Please note that "
+                "the format is experimental and could change in future."
             )
-
-        logger.warning(
-            "Detected ModelOpt MXFP8 checkpoint. Please note that "
-            "the format is experimental and could change in future."
-        )
+        else:
+            logger.warning(
+                "ModelOpt MXFP8 dynamic mode: bf16 weights will be "
+                "auto-quantized to MXFP8 for MoE layers at load time. "
+                "Linear layers remain bf16. (Per-arch FusedMoE method "
+                "must support dynamic quantization.)"
+            )
 
         self.kv_cache_quant_algo = kv_cache_quant_algo
 
@@ -1526,6 +1608,35 @@ class ModelOptMxFp8Config(ModelOptQuantConfigBase):
     def get_min_capability(cls) -> int:
         # Marlin kernel supports MXFP8 on SM80+
         return 80
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        # Dynamic mode (``--quantization modelopt_mxfp8`` on a bf16 checkpoint):
+        # per-arch FusedMoE methods (e.g. ``MotifMxfp8MoEMethod``) convert
+        # bf16->MXFP8 at load time and are installed via
+        # ``_replace_quant_method``, so return None here (FusedMoE falls back to
+        # ``UnquantizedFusedMoEMethod`` which allocates bf16 weights) and keep
+        # linear layers bf16. Serialized mode is unchanged — it delegates to the
+        # base dispatch (``ModelOptMxFp8LinearMethod`` / the serialized MoE path).
+        if not self.is_checkpoint_mxfp8_serialized:
+            if isinstance(layer, FusedMoE):
+                return None
+            if isinstance(layer, LinearBase):
+                return UnquantizedLinearMethod()
+        return super().get_quant_method(layer, prefix)
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> "ModelOptMxFp8Config":
+        # Dynamic-mode sentinel set by weight_utils.get_quant_config when
+        # --quantization=modelopt_mxfp8 is passed against a bf16 checkpoint.
+        if config.get("_mxfp8_dynamic"):
+            return cls(
+                is_checkpoint_mxfp8_serialized=False,
+                kv_cache_quant_algo=None,
+                exclude_modules=[],
+            )
+        return super().from_config(config)
 
     @classmethod
     def override_quantization_method(
@@ -1566,6 +1677,131 @@ class ModelOptMxFp8Config(ModelOptQuantConfigBase):
             kv_cache_quant_method,
             exclude_modules,
         )
+
+
+class ModelOptBlockFp8Config(ModelOptMxFp8Config):
+    """Config for the DeepGEMM block-FP8 (1x128) MoE path.
+
+    A thin alias of the MXFP8 dynamic config: it reuses the exact same
+    "load bf16, let the per-arch FusedMoE method quantize at load" plumbing
+    (``get_quant_method`` returns None for FusedMoE / bf16 for Linear). The only
+    difference is the name — motif's MoE layer keys off
+    ``isinstance(quant_config, ModelOptBlockFp8Config)`` to install the DeepGEMM
+    1x128 method (``MotifDeepGemmMoEMethod``) instead of the CUTLASS MXFP8 one.
+    Selected via ``--quantization modelopt_blockfp8``; opt-in only (never
+    auto-detected from a checkpoint).
+    """
+
+    def get_name(self) -> QuantizationMethods:
+        return "modelopt_blockfp8"
+
+    def get_quant_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        # Dynamic mode: FusedMoE is handled by MotifDeepGemmMoEMethod (installed
+        # by the model); dense linears are block-quantized at load with the same
+        # DeepSeek 1d2d recipe (128x128 weight / 1x128 activation). Layers built
+        # with quant_config=None (e.g. the fp32 router gate) never reach here.
+        if not self.is_checkpoint_mxfp8_serialized:
+            if isinstance(layer, FusedMoE):
+                return None
+            if isinstance(layer, LinearBase):
+                # Dense block-fp8 is opt-in (MOTIF_DENSE_FP8=1). Default keeps
+                # dense linears bf16: AA-Omniscience n=3 showed fp8 is
+                # quality-neutral on the aggregate metric but shifts behavior
+                # (attempt rate +1.8pt, 15x larger run-to-run accuracy
+                # variance), so bf16 stays the default for eval
+                # reproducibility; fp8 trades that for ~+2% throughput.
+                if os.environ.get("MOTIF_DENSE_FP8", "0") == "1":
+                    return MotifDynamicBlockFp8LinearMethod(self)
+                return UnquantizedLinearMethod()
+        return super().get_quant_method(layer, prefix)
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> "ModelOptBlockFp8Config":
+        # Dynamic-mode sentinel set by weight_utils.get_quant_config when
+        # --quantization=modelopt_blockfp8 is passed against a bf16 checkpoint.
+        if config.get("_blockfp8_dynamic"):
+            return cls(
+                is_checkpoint_mxfp8_serialized=False,
+                kv_cache_quant_algo=None,
+                exclude_modules=[],
+            )
+        return super().from_config(config)
+
+    @classmethod
+    def override_quantization_method(
+        cls, hf_quant_cfg, user_quant, hf_config=None
+    ) -> QuantizationMethods | None:
+        # Opt-in via the explicit flag only; do not auto-detect from a
+        # checkpoint's quant algo (that path belongs to MXFP8).
+        return None
+
+
+class ModelOptNvFp4DynamicConfig(ModelOptMxFp8Config):
+    """Config for the CUTLASS NVFP4 MoE path (dynamic or direct load).
+
+    Like ``ModelOptBlockFp8Config``, this is a thin alias of the MXFP8 dynamic
+    config: it reuses the same "let the per-arch FusedMoE method own the
+    weights" plumbing (``get_quant_method`` returns None for FusedMoE / bf16
+    for Linear). Motif's MoE layer keys off ``isinstance(quant_config,
+    ModelOptNvFp4DynamicConfig)`` to install the NVFP4 (E2M1 + 1x16 E4M3
+    blockscale) CUTLASS method (``MotifNvfp4MoEMethod``). Not related to the
+    upstream serialized ``modelopt_fp4`` path (``ModelOptNvFp4Config``).
+
+    Two modes, distinguished by ``direct_load``:
+
+    * ``False`` (dynamic): ``--quantization modelopt_nvfp4`` against a bf16
+      checkpoint — weights are quantized at load time.
+    * ``True`` (direct): the checkpoint was pre-quantized by
+      ``tools/motif_nvfp4_quantize_ckpt.py``; its ``config.json`` declares
+      ``quantization_config = {"quant_method": "modelopt_nvfp4"}`` so the
+      mode is auto-detected (no flag needed) and the packed NVFP4 tensors are
+      loaded directly.
+    """
+
+    direct_load: bool = False
+
+    def get_name(self) -> QuantizationMethods:
+        return "modelopt_nvfp4"
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> "ModelOptNvFp4DynamicConfig":
+        # Three entry points:
+        # * _nvfp4_dynamic sentinel (weight_utils.get_quant_config, bf16
+        #   checkpoint + --quantization modelopt_nvfp4): quantize at load.
+        # * _nvfp4_direct sentinel (same path, kept for explicitness).
+        # * The serialized checkpoint's own config.json quantization_config
+        #   ({"quant_method": "modelopt_nvfp4", ...}, written by
+        #   tools/motif_nvfp4_quantize_ckpt.py): get_quant_config returns
+        #   from_config(hf_quant_config) directly whenever config.json
+        #   carries a quantization_config, so the marker must be recognized
+        #   here — this is the direct-load path. (Dummy load format is not
+        #   supported against a serialized checkpoint; use the bf16 one.)
+        if config.get("_nvfp4_dynamic"):
+            direct = False
+        elif (
+            config.get("_nvfp4_direct")
+            or config.get("quant_method") == "modelopt_nvfp4"
+        ):
+            direct = True
+        else:
+            return super().from_config(config)
+        inst = cls(
+            is_checkpoint_mxfp8_serialized=False,
+            kv_cache_quant_algo=None,
+            exclude_modules=[],
+        )
+        inst.direct_load = direct
+        return inst
+
+    @classmethod
+    def override_quantization_method(
+        cls, hf_quant_cfg, user_quant, hf_config=None
+    ) -> QuantizationMethods | None:
+        # Opt-in via the explicit flag only; NVFP4 checkpoint auto-detection
+        # belongs to the serialized ModelOptNvFp4Config ("modelopt_fp4").
+        return None
 
 
 class ModelOptMxFp8LinearMethod(LinearMethodBase):

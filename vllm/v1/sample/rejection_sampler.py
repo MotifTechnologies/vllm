@@ -13,7 +13,15 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
-from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
+from vllm.v1.sample.logits_processor.builtin import (
+    MinTokensLogitsProcessor,
+)
+from vllm.v1.sample.logits_processor.repetition import (
+    RepetitionGuardLogitsProcessor,
+)
+from vllm.v1.sample.logits_processor.think_budget import (
+    ThinkingTokenBudgetLogitsProcessor,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
@@ -326,6 +334,17 @@ class RejectionSampler(nn.Module):
             if isinstance(processor, MinTokensLogitsProcessor):
                 logits = processor.apply_with_spec_decode(
                     logits, metadata.num_draft_tokens
+                )
+            elif isinstance(processor, ThinkingTokenBudgetLogitsProcessor):
+                logits = processor.apply_with_spec_decode(
+                    logits,
+                    metadata.num_draft_tokens,
+                    sampling_metadata.spec_token_ids,
+                )
+            elif isinstance(processor, RepetitionGuardLogitsProcessor):
+                logits = processor.apply_with_spec_decode(
+                    logits,
+                    metadata.num_draft_tokens,
                 )
 
         return logits

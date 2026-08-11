@@ -18,7 +18,6 @@ from vllm.v1.sample.logits_processor.builtin import (
     LogitBiasLogitsProcessor,
     MinPLogitsProcessor,
     MinTokensLogitsProcessor,
-    ThinkingTokenBudgetLogitsProcessor,
     process_dict_updates,
 )
 from vllm.v1.sample.logits_processor.interface import (
@@ -26,7 +25,13 @@ from vllm.v1.sample.logits_processor.interface import (
     LogitsProcessor,
     MoveDirectionality,
 )
+from vllm.v1.sample.logits_processor.repetition import (
+    RepetitionGuardLogitsProcessor,
+)
 from vllm.v1.sample.logits_processor.state import BatchUpdateBuilder, LogitsProcessors
+from vllm.v1.sample.logits_processor.think_budget import (
+    ThinkingTokenBudgetLogitsProcessor,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -52,6 +57,7 @@ BUILTIN_LOGITS_PROCESSORS: list[type[LogitsProcessor]] = [
     LogitBiasLogitsProcessor,
     MinPLogitsProcessor,
     ThinkingTokenBudgetLogitsProcessor,
+    RepetitionGuardLogitsProcessor,
 ]
 
 
@@ -206,8 +212,18 @@ def build_logitsprocs(
         logger.warning(
             "min_p and logit_bias parameters won't work with speculative decoding."
         )
+        # MinTokens, ThinkingTokenBudget and RepetitionGuard all
+        # implement a spec-decode aware apply (apply_with_spec_decode, wired
+        # in RejectionSampler), so they are safe under speculative decoding.
+        # Load them; the remaining builtins (min_p, logit_bias) have no
+        # spec-aware path and stay disabled.
         return LogitsProcessors(
-            [MinTokensLogitsProcessor(vllm_config, device, is_pin_memory)]
+            ctor(vllm_config, device, is_pin_memory)
+            for ctor in (
+                MinTokensLogitsProcessor,
+                ThinkingTokenBudgetLogitsProcessor,
+                RepetitionGuardLogitsProcessor,
+            )
         )
 
     custom_logitsprocs_classes = _load_custom_logitsprocs(custom_logitsprocs)
@@ -357,4 +373,5 @@ __all__ = [
     "LOGITSPROCS_GROUP",
     "AdapterLogitsProcessor",
     "ThinkingTokenBudgetLogitsProcessor",
+    "RepetitionGuardLogitsProcessor",
 ]

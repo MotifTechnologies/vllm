@@ -118,6 +118,14 @@ _TOOL_PARSERS_TO_REGISTER = {
         "mistral_tool_parser",
         "MistralToolParser",
     ),
+    "motif": (
+        "motif_tool_parser",
+        "MotifToolParser",
+    ),
+    "motif_hermes": (
+        "motif_tool_parser",
+        "MotifToolParser",
+    ),
     "olmo3": (
         "olmo3_tool_parser",
         "Olmo3PythonicToolParser",

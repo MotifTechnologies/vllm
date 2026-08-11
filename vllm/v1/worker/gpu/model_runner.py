@@ -215,6 +215,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 req_states=self.req_states,
                 logprobs_mode=self.model_config.logprobs_mode,
                 num_speculative_tokens=self.num_speculative_steps + 1,
+                vllm_config=self.vllm_config,
             )
             if self.speculative_config is not None:
                 self.rejection_sampler = RejectionSampler(
@@ -414,6 +415,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         uniform_decode: bool = False,
         skip_eplb: bool = False,
         is_profile: bool = False,
+        is_dp_idle_sync: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if skip_attn and not is_profile:
@@ -474,7 +476,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.execute_model_state = None
 
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
-        if self.speculator is not None:
+        # MOTIF: when the dense drafter skips DP batch coordination, idle-rank
+        # per-step dummies (execute_dummy_batch) have no drafter collective to
+        # pair with, so their draft forwards are pure waste — skip them so
+        # idle ranks reach the next step's main-model rendezvous sooner.
+        if self.speculator is not None and not (
+            is_dp_idle_sync
+            and getattr(self.speculator, "skip_dp_coordination", False)
+        ):
             assert self.sampler is not None
             mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
             if self.speculator.supports_mm_inputs:
@@ -671,7 +680,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
                 assert self.sampler is not None
                 self.sampler.add_request(
-                    req_index, prompt_len, new_req_data.sampling_params
+                    req_index,
+                    prompt_len,
+                    new_req_data.sampling_params,
+                    prompt_token_ids=new_req_data.prompt_token_ids,
                 )
                 assert self.prompt_logprobs_worker is not None
                 self.prompt_logprobs_worker.add_request(
@@ -1181,6 +1193,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.use_pp:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
             pp_broadcast(sampler_output.sampled_token_ids, num_sampled, num_rejected)
+
+        # MOTIF: advance the committed think-budget state by this step's
+        # accepted tokens (spec decode commits a variable number per request;
+        # chunked prefills commit zero).
+        if self.sampler is not None and self.sampler.think_budget_state is not None:
+            self.sampler.think_budget_state.commit(
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                input_batch.idx_mapping,
+                input_batch.idx_mapping_np,
+            )
 
         assert self.prompt_logprobs_worker is not None
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(

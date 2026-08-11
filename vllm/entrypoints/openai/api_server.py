@@ -671,8 +671,7 @@ async def build_and_serve_renderer(
 async def run_server(args, **uvicorn_kwargs) -> None:
     """Run a single-worker API server."""
 
-    # Add process-specific prefix to stdout and stderr.
-    decorate_logs("APIServer")
+    decorate_logs("APIServer", skip_if_decorated=True)
 
     listen_address, sock = setup_server(args)
     await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)

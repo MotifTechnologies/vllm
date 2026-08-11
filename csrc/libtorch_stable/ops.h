@@ -77,6 +77,14 @@ void get_cutlass_moe_mm_problem_sizes_from_expert_offsets(
     torch::stable::Tensor& problem_sizes2, const int64_t n, const int64_t k,
     const bool swap_ab);
 
+void get_cutlass_moe_mm_problem_sizes_and_nvfp4_offsets(
+    const torch::stable::Tensor& expert_first_token_offset,
+    torch::stable::Tensor& problem_sizes1,
+    torch::stable::Tensor& problem_sizes2,
+    torch::stable::Tensor& expert_offsets,
+    torch::stable::Tensor& blockscale_offsets, const int64_t n,
+    const int64_t k);
+
 void get_cutlass_batched_moe_mm_data(
     torch::stable::Tensor& expert_offsets,
     torch::stable::Tensor& problem_sizes1,
@@ -121,6 +129,15 @@ void scaled_fp4_experts_quant(
     torch::stable::Tensor const& input_global_scale,
     torch::stable::Tensor const& input_offset_by_experts,
     torch::stable::Tensor const& output_scale_offset_by_experts);
+
+void scaled_fp4_experts_quant_permuted(
+    torch::stable::Tensor& output, torch::stable::Tensor& output_scale,
+    torch::stable::Tensor const& input,
+    torch::stable::Tensor const& input_global_scale,
+    torch::stable::Tensor const& input_offset_by_experts,
+    torch::stable::Tensor const& output_scale_offset_by_experts,
+    torch::stable::Tensor const& permuted_idx,
+    torch::stable::Tensor& inv_permuted_idx, int64_t topk);
 
 void silu_and_mul_scaled_fp4_experts_quant(
     torch::stable::Tensor& output, torch::stable::Tensor& output_scale,

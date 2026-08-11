@@ -283,7 +283,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         a1q_perm = _resize_cache(
             workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, K)
         )
-        a1q, a1q_scale, expert_ids, inv_perm = deepgemm_moe_permute(
+        a1q, a1q_scale, expert_ids, inv_perm, _ = deepgemm_moe_permute(
             aq=a1q,
             aq_scale=a1q_scale,
             topk_ids=topk_ids,
@@ -491,7 +491,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         a1q_perm = _resize_cache(
             workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, K)
         )
-        a1q, a1q_scale, expert_ids, inv_perm = deepgemm_moe_permute(
+        a1q, a1q_scale, expert_ids, inv_perm, _ = deepgemm_moe_permute(
             aq=a1q,
             aq_scale=a1q_scale,
             topk_ids=topk_ids,

@@ -86,6 +86,17 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "    Tensor! problem_sizes2, "
       "    int n, int k, bool swap_ab) -> ()");
 
+  // Compute the same problem sizes plus the int32 expert and 128-row-aligned
+  // blockscale offsets consumed by NVFP4 expert quantization and GEMMs.
+  ops.def(
+      "get_cutlass_moe_mm_problem_sizes_and_nvfp4_offsets("
+      "    Tensor expert_first_token_offset, "
+      "    Tensor! problem_sizes1, "
+      "    Tensor! problem_sizes2, "
+      "    Tensor! expert_offsets, "
+      "    Tensor! blockscale_offsets, "
+      "    int n, int k) -> ()");
+
   // A function that computes data required to run fused MoE with w8a8 grouped
   // GEMM in batched expert format. It takes expert_num_tokens
   // as an input, and computes expert_offsets (token start indices of each
@@ -147,6 +158,13 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "scaled_fp4_experts_quant(Tensor! output, Tensor! output_scale,"
       "Tensor input, Tensor input_global_scale, Tensor input_offset_by_experts,"
       "Tensor output_scale_offset_by_experts) -> ()");
+
+  // Fuse route-map gathering with the first NVFP4 experts quantization.
+  ops.def(
+      "scaled_fp4_experts_quant_permuted(Tensor! output, Tensor! output_scale,"
+      "Tensor input, Tensor input_global_scale, Tensor input_offset_by_experts,"
+      "Tensor output_scale_offset_by_experts, Tensor permuted_idx, Tensor! "
+      "inv_permuted_idx, int topk) -> ()");
 
   // Fused SiLU+Mul+NVFP4 experts quantization.
   ops.def(
@@ -241,6 +259,9 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("get_cutlass_moe_mm_data", TORCH_BOX(&get_cutlass_moe_mm_data));
   ops.impl("get_cutlass_moe_mm_problem_sizes_from_expert_offsets",
            TORCH_BOX(&get_cutlass_moe_mm_problem_sizes_from_expert_offsets));
+  ops.impl("get_cutlass_moe_mm_problem_sizes_and_nvfp4_offsets",
+           TORCH_BOX(
+               &get_cutlass_moe_mm_problem_sizes_and_nvfp4_offsets));
   ops.impl("get_cutlass_batched_moe_mm_data",
            TORCH_BOX(&get_cutlass_batched_moe_mm_data));
 
@@ -249,6 +270,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("scaled_fp4_quant", TORCH_BOX(&scaled_fp4_quant_func));
   ops.impl("scaled_fp4_quant.out", TORCH_BOX(&scaled_fp4_quant_out));
   ops.impl("scaled_fp4_experts_quant", TORCH_BOX(&scaled_fp4_experts_quant));
+  ops.impl("scaled_fp4_experts_quant_permuted",
+           TORCH_BOX(&scaled_fp4_experts_quant_permuted));
   ops.impl("silu_and_mul_scaled_fp4_experts_quant",
            TORCH_BOX(&silu_and_mul_scaled_fp4_experts_quant));
   ops.impl("silu_and_mul_nvfp4_quant", TORCH_BOX(&silu_and_mul_nvfp4_quant));

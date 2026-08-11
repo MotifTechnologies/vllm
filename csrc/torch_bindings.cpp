@@ -174,6 +174,45 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "float epsilon) -> ()");
   ops.impl("fused_add_rms_norm", torch::kCUDA, &fused_add_rms_norm);
 
+  // Grouped fused-mul Poly Norm activation (motif3 MoE, Standard format).
+  // Per-row activation: row r → (token_idx, k_idx) = (r/top_k, r%top_k).
+  // Expert lookup: local_e = expert_map[topk_ids[token_idx, k_idx]] (or
+  // identity when expert_map is None). Non-local rows are skipped.
+  // Computes: poly = w[le]·rms_normed(x^k) + b[le]; out = poly * mul.
+  // Folds gate/up clamp inside the kernel when hidden_clamp > 0.
+  ops.def(
+      "grouped_poly_norm_forward(Tensor input, Tensor mul, Tensor weight, "
+      "Tensor bias, Tensor topk_ids, Tensor? expert_map, int top_k, "
+      "float eps, float hidden_clamp) -> Tensor");
+  ops.impl("grouped_poly_norm_forward", torch::kCUDA,
+           &grouped_poly_norm_forward);
+
+#if defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100
+  // Motif ModelOpt NVFP4 MoE: grouped PolyNorm directly to expert-aware
+  // swizzled NVFP4 activation and E4M3 scale factors for GEMM2.
+  ops.def(
+      "grouped_poly_norm_nvfp4_quant(Tensor! output, Tensor! output_scale, "
+      "Tensor input, Tensor mul, Tensor weight, Tensor bias, "
+      "Tensor expert_offsets, Tensor blockscale_offsets, "
+      "Tensor input_global_scale, float eps, float hidden_clamp, "
+      "float polynorm_output_scale) -> ()");
+  ops.impl("grouped_poly_norm_nvfp4_quant", torch::kCUDA,
+           &grouped_poly_norm_nvfp4_quant);
+#endif
+
+  // motif3 DeepGEMM MoE (M2): fused grouped PolyNorm + 1x128 FP8 requant.
+  // Reads combined GEMM1 output gate_up [N,2I] in place; returns
+  // (out_q [N,I] e4m3, scale [N,I/128] column-major fp32 — or, with
+  // packed_scale, [N, ceil(I/128/4)] int32 in DeepGEMM's packed-UE8M0 SFA
+  // layout so the grouped GEMM skips its transpose_and_pack). Pure.
+  ops.def(
+      "grouped_poly_norm_fp8_quant(Tensor gate_up, Tensor weight, Tensor bias, "
+      "Tensor group_ids, float eps, float hidden_clamp, "
+      "float polynorm_output_scale, bool use_ue8m0, "
+      "bool packed_scale=False) -> (Tensor, Tensor)");
+  ops.impl("grouped_poly_norm_fp8_quant", torch::kCUDA,
+           &grouped_poly_norm_fp8_quant);
+
   // Function for fused QK Norm and RoPE
   ops.def(
       "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "

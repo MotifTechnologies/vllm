@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import os
 from importlib.util import find_spec
 from typing import Any, cast
 
@@ -140,6 +141,10 @@ class SpecDecodeBaseProposer:
         # gpu_model_runner._check_and_update_cudagraph_mode after
         # adjust_cudagraph_sizes_for_spec_decode is called.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
+
+        # MOTIF: set in load_model(); when True, drafter passes skip the
+        # per-pass cross-DP batch coordination (dense drafter, no collectives).
+        self.skip_draft_dp_coordination = False
 
         # persistent buffers for cuda graph
         self.input_ids = torch.zeros(
@@ -1373,6 +1378,8 @@ class SpecDecodeBaseProposer:
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(target_language_model)
 
+        self.skip_draft_dp_coordination = self._should_skip_dp_coordination()
+
         if (
             self.parallel_drafting
             and self.pass_hidden_states_to_model
@@ -1718,6 +1725,44 @@ class SpecDecodeBaseProposer:
         )
         logger.debug("Using block size %d for drafting layers", self.block_size)
 
+    def _should_skip_dp_coordination(self) -> bool:
+        """MOTIF: whether drafter passes can skip cross-DP batch coordination.
+
+        True only for dense drafters (no cross-rank collectives in the draft
+        forward). The decision must be identical on every DP rank; it depends
+        only on the draft model architecture and a process-wide env toggle.
+        """
+        if self.vllm_config.parallel_config.data_parallel_size <= 1:
+            return False
+        if os.environ.get("MOTIF_DRAFT_SKIP_DP_COORD", "1") != "1":
+            logger.info_once(
+                "MOTIF_DRAFT_SKIP_DP_COORD=0: keeping per-pass DP batch "
+                "coordination in the drafter."
+            )
+            return False
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
+        # Conservative scan: any FusedMoE instance or MoE-looking wrapper
+        # keeps the coordination.
+        moe_like = {
+            type(m).__name__
+            for m in self.model.modules()
+            if isinstance(m, FusedMoE) or "MoE" in type(m).__name__
+        }
+        if moe_like:
+            logger.info_once(
+                "Draft model contains MoE-like modules (%s); keeping per-pass "
+                "DP batch coordination in the drafter.",
+                sorted(moe_like),
+            )
+            return False
+        logger.info_once(
+            "Draft model has no MoE layers: skipping per-pass DP batch "
+            "coordination in the drafter (saves 1-2 rendezvous per step; "
+            "set MOTIF_DRAFT_SKIP_DP_COORD=0 to disable)."
+        )
+        return True
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -1733,6 +1778,23 @@ class SpecDecodeBaseProposer:
         # coordinate across ranks
         # TODO(Flechman): support DBO ubatching
         should_ubatch, num_tokens_across_dp = False, None
+        if (
+            self.vllm_config.parallel_config.data_parallel_size > 1
+            and self.skip_draft_dp_coordination
+        ):
+            # MOTIF: dense drafter — no collectives in the draft forward, so
+            # skip the cross-rank rendezvous and build the DP-metadata tensor
+            # locally. set_forward_context runs its own
+            # coordinate_batch_across_dp when handed None with dp_size > 1,
+            # so a filled tensor (DPMetadata asserts [dp_rank] == num_tokens)
+            # is required rather than None.
+            num_tokens_across_dp = torch.full(
+                (self.vllm_config.parallel_config.data_parallel_size,),
+                num_tokens_padded,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            return cudagraph_mode, num_tokens_padded, num_tokens_across_dp
         if self.vllm_config.parallel_config.data_parallel_size > 1:
             should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
                 coordinate_batch_across_dp(

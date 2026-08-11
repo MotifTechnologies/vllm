@@ -140,6 +140,8 @@ template <bool SWAP_AB>
 __global__ void compute_problem_sizes_from_expert_offsets(
     const int64_t* __restrict__ expert_first_token_offset,
     int32_t* __restrict__ problem_sizes1, int32_t* __restrict__ problem_sizes2,
+    int32_t* __restrict__ expert_offsets,
+    int32_t* __restrict__ blockscale_offsets,
     const int num_experts, const int n, const int k) {
   int const expert_id = blockIdx.x * blockDim.x + threadIdx.x;
   if (expert_id >= num_experts) {
@@ -149,6 +151,26 @@ __global__ void compute_problem_sizes_from_expert_offsets(
   int64_t const m64 = expert_first_token_offset[expert_id + 1] -
                       expert_first_token_offset[expert_id];
   int32_t const m = static_cast<int32_t>(m64);
+
+  if (expert_offsets != nullptr) {
+    expert_offsets[expert_id] =
+        static_cast<int32_t>(expert_first_token_offset[expert_id]);
+    if (expert_id == 0) {
+      expert_offsets[num_experts] =
+          static_cast<int32_t>(expert_first_token_offset[num_experts]);
+    }
+  }
+
+  if (blockscale_offsets != nullptr && expert_id == 0) {
+    int64_t aligned_prefix = 0;
+    blockscale_offsets[0] = 0;
+    for (int expert = 0; expert < num_experts; ++expert) {
+      int64_t const token_count = expert_first_token_offset[expert + 1] -
+                                  expert_first_token_offset[expert];
+      aligned_prefix += ((token_count + 127) / 128) * 128;
+      blockscale_offsets[expert + 1] = static_cast<int32_t>(aligned_prefix);
+    }
+  }
 
   int32_t* ps1 = problem_sizes1 + expert_id * 3;
   int32_t* ps2 = problem_sizes2 + expert_id * 3;
@@ -179,7 +201,8 @@ void get_cutlass_moe_mm_problem_sizes_from_expert_offsets_caller(
     const torch::stable::Tensor& expert_first_token_offset,
     torch::stable::Tensor& problem_sizes1,
     torch::stable::Tensor& problem_sizes2, const int64_t n, const int64_t k,
-    const bool swap_ab) {
+    const bool swap_ab, torch::stable::Tensor* expert_offsets,
+    torch::stable::Tensor* blockscale_offsets) {
   STD_TORCH_CHECK(expert_first_token_offset.is_cuda(),
                   "expert_first_token_offset must be a CUDA tensor");
   STD_TORCH_CHECK(expert_first_token_offset.scalar_type() ==
@@ -211,6 +234,41 @@ void get_cutlass_moe_mm_problem_sizes_from_expert_offsets_caller(
   STD_TORCH_CHECK(n <= INT32_MAX && k <= INT32_MAX,
                   "n and k must fit in int32");
 
+  STD_TORCH_CHECK((expert_offsets == nullptr) ==
+                      (blockscale_offsets == nullptr),
+                  "expert_offsets and blockscale_offsets must be provided "
+                  "together");
+  int32_t* expert_offsets_ptr = nullptr;
+  int32_t* blockscale_offsets_ptr = nullptr;
+  if (expert_offsets != nullptr) {
+    STD_TORCH_CHECK(expert_offsets->is_cuda() &&
+                        blockscale_offsets->is_cuda(),
+                    "NVFP4 offsets must be CUDA tensors");
+    STD_TORCH_CHECK(
+        expert_offsets->get_device_index() ==
+                expert_first_token_offset.get_device_index() &&
+            blockscale_offsets->get_device_index() ==
+                expert_first_token_offset.get_device_index(),
+        "NVFP4 offsets must be on the same device as expert offsets");
+    STD_TORCH_CHECK(
+        expert_offsets->scalar_type() ==
+                torch::headeronly::ScalarType::Int &&
+            blockscale_offsets->scalar_type() ==
+                torch::headeronly::ScalarType::Int,
+        "NVFP4 offsets must be int32");
+    STD_TORCH_CHECK(expert_offsets->is_contiguous() &&
+                        blockscale_offsets->is_contiguous(),
+                    "NVFP4 offsets must be contiguous");
+    STD_TORCH_CHECK(expert_offsets->dim() == 1 &&
+                        blockscale_offsets->dim() == 1 &&
+                        expert_offsets->numel() == num_experts64 + 1 &&
+                        blockscale_offsets->numel() == num_experts64 + 1,
+                    "NVFP4 offsets must have num_experts + 1 elements");
+    expert_offsets_ptr = expert_offsets->mutable_data_ptr<int32_t>();
+    blockscale_offsets_ptr =
+        blockscale_offsets->mutable_data_ptr<int32_t>();
+  }
+
   int const num_experts = static_cast<int>(num_experts64);
   auto stream =
       get_current_cuda_stream(expert_first_token_offset.get_device_index());
@@ -225,6 +283,8 @@ void get_cutlass_moe_mm_problem_sizes_from_expert_offsets_caller(
   VLLM_STABLE_DISPATCH_BOOL(swap_ab, SwapAB, [&] {
     compute_problem_sizes_from_expert_offsets<SwapAB>
         <<<blocks, threads, 0, stream>>>(offsets_ptr, ps1_ptr, ps2_ptr,
+                                         expert_offsets_ptr,
+                                         blockscale_offsets_ptr,
                                          num_experts, static_cast<int>(n),
                                          static_cast<int>(k));
   });

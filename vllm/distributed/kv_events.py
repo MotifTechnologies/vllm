@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import queue
 import threading
 import time
@@ -322,7 +323,7 @@ class ZmqEventPublisher(EventPublisher):
 
         # Payload
         self._seq_gen = count()
-        self._topic_bytes = topic.encode("utf-8")
+        self._topic_bytes = self._render_topic(topic, self._dp_rank).encode("utf-8")
 
         # Thread
         self._running = True
@@ -457,6 +458,39 @@ class ZmqEventPublisher(EventPublisher):
         # Send end of sequence marker
         # receiving payload is (-1, b""")
         self._replay.send_multipart((client_id, b"", self.END_SEQ, b""))
+
+    @staticmethod
+    def _render_topic(topic: str, data_parallel_rank: int) -> str:
+        """Render per-DP-rank placeholders in the ZMQ topic string.
+
+        Each data-parallel rank runs its own publisher but, by default, they
+        all share one topic. A consumer that attributes events by *topic*
+        (e.g. an llm-d endpoint-picker sitting in front of a multi-port
+        external-LB deployment, where every rank is an individually routable
+        endpoint) then cannot tell the ranks apart. Supporting placeholders
+        lets each rank publish under a distinct topic that encodes its own
+        routable identity:
+
+        - ``{dp_rank}``: the global data-parallel rank.
+        - ``{port}``: the rank's routable API-server port, read from
+          ``VLLM_KV_EVENTS_ENDPOINT_PORT`` (set per child by the DP supervisor
+          to ``--port + local_rank``). Left empty (with a warning) if unset.
+
+        A topic containing no ``{`` is returned unchanged, so single-rank,
+        non-DP and approx-mode deployments keep their existing behaviour.
+        """
+        if "{" not in topic:
+            return topic
+        port = os.environ.get("VLLM_KV_EVENTS_ENDPOINT_PORT", "")
+        if "{port}" in topic and not port:
+            logger.warning(
+                "KV events topic %r references {port} but "
+                "VLLM_KV_EVENTS_ENDPOINT_PORT is unset; substituting empty.",
+                topic,
+            )
+        return topic.replace("{dp_rank}", str(data_parallel_rank)).replace(
+            "{port}", port
+        )
 
     @staticmethod
     def offset_endpoint_port(

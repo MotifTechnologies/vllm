@@ -1034,6 +1034,56 @@ def get_cutlass_moe_mm_problem_sizes_from_expert_offsets(
     )
 
 
+def get_cutlass_moe_mm_problem_sizes_and_nvfp4_offsets(
+    expert_first_token_offset: torch.Tensor,
+    problem_sizes1: torch.Tensor,
+    problem_sizes2: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    blockscale_offsets: torch.Tensor,
+    n: int,
+    k: int,
+) -> None:
+    torch.ops._C.get_cutlass_moe_mm_problem_sizes_and_nvfp4_offsets(
+        expert_first_token_offset,
+        problem_sizes1,
+        problem_sizes2,
+        expert_offsets,
+        blockscale_offsets,
+        n,
+        k,
+    )
+
+
+def moe_permute(
+    input_tensor: torch.Tensor,
+    topk_ids: torch.Tensor,
+    token_expert_indices: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    n_expert: int,
+    n_local_expert: int,
+    topk: int,
+    permuted_input: torch.Tensor,
+    expert_first_token_offset: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+    permuted_idx: torch.Tensor,
+    skip_input_permute: bool = False,
+) -> None:
+    torch.ops._moe_C.moe_permute(
+        input_tensor,
+        topk_ids,
+        token_expert_indices,
+        expert_map,
+        n_expert,
+        n_local_expert,
+        topk,
+        permuted_input,
+        expert_first_token_offset,
+        inv_permuted_idx,
+        permuted_idx,
+        skip_input_permute,
+    )
+
+
 def shuffle_rows(input_tensor: torch.Tensor, dst2src_map: torch.Tensor):
     """
     Shuffle and expand the input tensor according to the dst2src_map and store the result in output_tensor.
@@ -1828,6 +1878,60 @@ def scaled_fp4_experts_quant(
     )
     output_scales = output_scales.view(torch.float8_e4m3fn)
     return output, output_scales
+
+
+def scaled_fp4_experts_quant_permuted(
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    input_tensor: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    blockscale_offsets: torch.Tensor,
+    permuted_idx: torch.Tensor,
+    inv_permuted_idx: torch.Tensor,
+    topk: int,
+) -> None:
+    torch.ops._C.scaled_fp4_experts_quant_permuted(
+        output,
+        output_scale,
+        input_tensor,
+        input_global_scale,
+        expert_offsets,
+        blockscale_offsets,
+        permuted_idx,
+        inv_permuted_idx,
+        topk,
+    )
+
+
+def grouped_poly_norm_nvfp4_quant(
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    input_tensor: torch.Tensor,
+    mul: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    blockscale_offsets: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    eps: float,
+    hidden_clamp: float,
+    polynorm_output_scale: float,
+) -> None:
+    torch.ops._C.grouped_poly_norm_nvfp4_quant(
+        output,
+        output_scale,
+        input_tensor,
+        mul,
+        weight,
+        bias,
+        expert_offsets,
+        blockscale_offsets,
+        input_global_scale,
+        eps,
+        hidden_clamp,
+        polynorm_output_scale,
+    )
 
 
 def silu_and_mul_scaled_fp4_experts_quant(

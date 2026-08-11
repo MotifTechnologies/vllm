@@ -903,7 +903,28 @@ def get_vllm_version() -> str:
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
         return get_version(write_to="vllm/_version.py")
 
+    # Motif fork versioning: build the version from the newest motif3-* git tag
+    # (base, e.g. motif3-0.20.2 -> 0.20.2) + the current commit, so EVERY build
+    # from this repo — regardless of env — reads "0.20.2+motif3.g<sha>" instead
+    # of setuptools-scm's guess-next form ("0.20.3.dev1+g<sha>") derived from
+    # ancient upstream tags. Falls back to plain scm versioning (+ a motif3
+    # marker) when git or the tag is unavailable (e.g. sdist).
+    try:
+        base = subprocess.check_output(
+            ["git", "describe", "--tags", "--abbrev=0", "--match", "motif3-*"],
+            cwd=ROOT_DIR, text=True, stderr=subprocess.DEVNULL,
+        ).strip().removeprefix("motif3-")
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=ROOT_DIR, text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = f"{base}+motif3.g{sha}"
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
     version = get_version(write_to="vllm/_version.py")
+    if "motif3" not in version:
+        version += ("." if "+" in version else "+") + "motif3"
+
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():

@@ -323,6 +323,22 @@ class SpeculativeConfig:
                 }
             )
 
+        if hf_config.model_type == "Motif" and getattr(
+            hf_config, "num_nextn_predict_layers", 0
+        ):
+            # Motif MTP draft model: route to "mtp" method (model_type "mtp" is in
+            # MTPModelTypes) and the MotifMTP class via architectures. num_hidden_layers
+            # is zeroed so the draft only builds the MTP predictor layer(s).
+            hf_config.model_type = "mtp"
+            n_predict = hf_config.num_nextn_predict_layers
+            hf_config.update(
+                {
+                    "num_hidden_layers": 0,
+                    "n_predict": n_predict,
+                    "architectures": ["MotifMTPModel"],
+                }
+            )
+
         if hf_config.architectures[0] == "Glm4MoeForCausalLM":
             hf_config.model_type = "glm4_moe_mtp"
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)

@@ -17,7 +17,8 @@ void moe_permute(
     torch::Tensor& permuted_input,             // [permuted_size, hidden]
     torch::Tensor& expert_first_token_offset,  // [n_local_expert + 1]
     torch::Tensor& inv_permuted_idx,           // [n_token, topk]
-    torch::Tensor& permuted_idx) {             // [permute_size]
+    torch::Tensor& permuted_idx,               // [permute_size]
+    bool skip_input_permute) {
   TORCH_CHECK(expert_first_token_offset.scalar_type() == at::ScalarType::Long,
               "expert_first_token_offset must be int64");
   TORCH_CHECK(topk_ids.scalar_type() == at::ScalarType::Int,
@@ -28,11 +29,29 @@ void moe_permute(
               "inv_permuted_idx must be int32");
   TORCH_CHECK(expert_first_token_offset.size(0) == n_local_expert + 1,
               "expert_first_token_offset shape != n_local_expert+1")
-  TORCH_CHECK(inv_permuted_idx.sizes() == token_expert_indices.sizes(),
-              "token_expert_indices shape must be same as inv_permuted_idx");
+  if (token_expert_indices.numel() == 0) {
+    TORCH_CHECK(skip_input_permute,
+                "empty source rows require map-only permutation");
+  } else {
+    TORCH_CHECK(inv_permuted_idx.sizes() == token_expert_indices.sizes(),
+                "token_expert_indices shape must be same as inv_permuted_idx");
+  }
   auto n_token = input.sizes()[0];
   auto n_hidden = input.sizes()[1];
   auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  if (skip_input_permute && token_expert_indices.numel() == 0) {
+    const int* expert_map_ptr = expert_map.has_value()
+                                    ? get_ptr<const int>(expert_map.value())
+                                    : nullptr;
+    stableMapOnlyExpertSortLauncher(
+        get_ptr<const int>(topk_ids), expert_map_ptr,
+        get_ptr<int>(permuted_idx),
+        get_ptr<int64_t>(expert_first_token_offset), n_token, n_expert,
+        n_local_expert, topk, stream);
+    return;
+  }
+
   const long sorter_size =
       CubKeyValueSorter::getWorkspaceSize(n_token * topk, n_expert);
   auto sort_workspace = torch::empty(
@@ -40,7 +59,11 @@ void moe_permute(
       torch::dtype(torch::kInt8).device(torch::kCUDA).requires_grad(false));
   torch::Tensor topk_ids_for_sort = topk_ids;
   auto permuted_experts_id = torch::empty_like(topk_ids);
-  auto sorted_row_idx = torch::empty_like(inv_permuted_idx);
+  // The fused Motif NVFP4 path consumes the sorted source-row map directly in
+  // its first quantizer. Avoid allocating a second map in that case.
+  auto sorted_row_idx = skip_input_permute
+                            ? permuted_idx
+                            : torch::empty_like(inv_permuted_idx);
 
   CubKeyValueSorter sorter{};
   int64_t* valid_num_ptr = nullptr;
@@ -69,14 +92,17 @@ void moe_permute(
       get_ptr<int64_t>(expert_first_token_offset), n_token, n_expert,
       n_local_expert, topk, sorter, get_ptr<int>(sort_workspace), stream);
 
-  // dispatch expandInputRowsKernelLauncher
-  MOE_DISPATCH(input.scalar_type(), [&] {
-    expandInputRowsKernelLauncher<scalar_t>(
-        get_ptr<scalar_t>(input), get_ptr<scalar_t>(permuted_input),
-        get_ptr<int>(sorted_row_idx), get_ptr<int>(inv_permuted_idx),
-        get_ptr<int>(permuted_idx), get_ptr<int64_t>(expert_first_token_offset),
-        n_token, valid_num_ptr, n_hidden, topk, n_local_expert, stream);
-  });
+  if (!skip_input_permute) {
+    // Materialize the traditional permuted BF16 input and both route maps.
+    MOE_DISPATCH(input.scalar_type(), [&] {
+      expandInputRowsKernelLauncher<scalar_t>(
+          get_ptr<scalar_t>(input), get_ptr<scalar_t>(permuted_input),
+          get_ptr<int>(sorted_row_idx), get_ptr<int>(inv_permuted_idx),
+          get_ptr<int>(permuted_idx),
+          get_ptr<int64_t>(expert_first_token_offset), n_token, valid_num_ptr,
+          n_hidden, topk, n_local_expert, stream);
+    });
+  }
 }
 
 void moe_unpermute(
@@ -175,7 +201,8 @@ void moe_permute(const torch::Tensor& input, const torch::Tensor& topk_ids,
                  int64_t n_expert, int64_t n_local_expert, int64_t topk,
                  torch::Tensor& permuted_input,
                  torch::Tensor& expert_first_token_offset,
-                 torch::Tensor& inv_permuted_idx, torch::Tensor& permuted_idx) {
+                 torch::Tensor& inv_permuted_idx, torch::Tensor& permuted_idx,
+                 bool skip_input_permute) {
   TORCH_CHECK(false, "moe_permute is not supported on CUDA < 12.0");
 }
 

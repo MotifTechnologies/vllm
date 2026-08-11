@@ -109,6 +109,78 @@ void computeExpertFirstTokenOffset(int const* sorted_indices,
       sorted_indices, total_indices, num_experts, expert_first_token_offset);
 }
 
+// Decode-sized map-only routing does not need a materialized source-index
+// input or sorted expert IDs. Count mapped experts, prefix the counts, and
+// write source routes in stable input order in a single block.
+__global__ void stableMapOnlyExpertSortKernel(
+    const int* topk_ids, const int* expert_map, int* permuted_rows,
+    int64_t* expert_first_token_offset, int total_rows, int num_experts,
+    int num_experts_per_node) {
+  extern __shared__ int shared[];
+  int const num_mapped_experts = 2 * num_experts;
+  int* expert_prefix = shared;
+  int* mapped_experts = expert_prefix + num_mapped_experts + 1;
+
+  for (int i = threadIdx.x; i <= num_mapped_experts; i += blockDim.x) {
+    expert_prefix[i] = 0;
+  }
+  __syncthreads();
+
+  int const source_row = threadIdx.x;
+  if (source_row < total_rows) {
+    int expert = topk_ids[source_row];
+    if (expert_map != nullptr) {
+      int const local_expert = expert_map[expert];
+      expert = local_expert < 0 ? expert + num_experts : local_expert;
+    }
+    mapped_experts[source_row] = expert;
+    atomicAdd(&expert_prefix[expert + 1], 1);
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    for (int expert = 0; expert < num_mapped_experts; ++expert) {
+      expert_prefix[expert + 1] += expert_prefix[expert];
+    }
+  }
+  __syncthreads();
+
+  for (int expert = threadIdx.x; expert <= num_experts_per_node;
+       expert += blockDim.x) {
+    expert_first_token_offset[expert] = expert_prefix[expert];
+  }
+
+  if (source_row < total_rows) {
+    int const expert = mapped_experts[source_row];
+    int rank_in_expert = 0;
+    for (int prior_row = 0; prior_row < source_row; ++prior_row) {
+      rank_in_expert += mapped_experts[prior_row] == expert;
+    }
+    permuted_rows[expert_prefix[expert] + rank_in_expert] = source_row;
+  }
+}
+
+void stableMapOnlyExpertSortLauncher(
+    const int* topk_ids, const int* expert_map, int* permuted_rows,
+    int64_t* expert_first_token_offset, int num_rows, int num_experts,
+    int num_experts_per_node, int topk, cudaStream_t stream) {
+  int const total_rows = num_rows * topk;
+  TORCH_CHECK(total_rows > 0 && total_rows <= 1024,
+              "map-only expert sort supports 1..1024 routed rows");
+  TORCH_CHECK(num_experts > 0 && num_experts <= 512,
+              "map-only expert sort supports 1..512 experts");
+  TORCH_CHECK(num_experts_per_node > 0 &&
+                  num_experts_per_node <= num_experts,
+              "invalid local expert count");
+  int threads = 128;
+  while (threads < total_rows) threads *= 2;
+  size_t const shared_size =
+      (2 * num_experts + 1 + total_rows) * sizeof(int);
+  stableMapOnlyExpertSortKernel<<<1, threads, shared_size, stream>>>(
+      topk_ids, expert_map, permuted_rows, expert_first_token_offset,
+      total_rows, num_experts, num_experts_per_node);
+}
+
 void sortAndScanExpert(const int* expert_for_source_row, const int* source_rows,
                        int* permuted_experts, int* permuted_rows,
                        int64_t* expert_first_token_offset, int num_rows,

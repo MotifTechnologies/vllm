@@ -47,7 +47,10 @@ class FlashInferMLABackend(MLACommonBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [32, 64]
+        # cute-dsl MLA supports page_size 128 (block_num % (128/block_size)==0 always
+        # holds for 128); the [32,64] cap is the trtllm-gen XQA constraint. motif keeps
+        # block_size 128 so the hybrid full-attn/SWA KV grouping is unchanged.
+        return [32, 64, 128]
 
     @staticmethod
     def get_name() -> str:
@@ -93,6 +96,20 @@ class FlashInferMLABackend(MLACommonBackend):
 
     @classmethod
     def get_required_kv_cache_layout(cls) -> "KVCacheLayoutType | None":
+        # MOTIF FIX: "HND" is set GLOBALLY via set_kv_cache_layout() (selector.py)
+        # and is read by EVERY backend, including motif's hybrid SWA layers
+        # (FlashAttentionDiffKV). Forcing "HND" transposes the SWA KV cache stride
+        # (NHD (0,1,2,3) -> HND (0,2,1,3)), corrupting the 39 SWA layers -> garbage
+        # output, even though the MLA cache itself is head-agnostic (num_kv_heads=1,
+        # so HND==NHD physically) and the cute-dsl MLA kernel reads it correctly
+        # regardless (verified: forward_mqa torch-ref rel~0.003). The upstream "HND"
+        # requirement exists for the trtllm-gen XQA kernel; the cute-dsl backend does
+        # not need it. Return None (like CutlassMLABackend) so the global layout
+        # stays the default NHD and the SWA layers are laid out correctly.
+        import os as _os
+
+        if _os.environ.get("MOTIF_FLASHINFER_MLA_BACKEND", "cute-dsl") == "cute-dsl":
+            return None
         return "HND"
 
 
@@ -187,10 +204,26 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             if is_quantized_kv_cache(self.kv_cache_dtype):
                 self.bmm2_scale *= layer._k_scale_float
 
+        # MOTIF: route MLA decode through flashinfer's cute-dsl backend.
+        # The default trtllm-gen (XQA) kernel rejects motif's num_heads=80
+        # ("numHeadsQ/numHeadsKv is not supported"); cute-dsl supports
+        # num_heads<128 via folding (flashinfer PR#3309) AND keeps bf16 KV
+        # (byte-identical on B200, PR#3664). num_spec=1 => verify q_len=2 (<=4),
+        # so the modular-vs-monolithic eligibility gate (#3664, q_len>4) is not hit.
+        # Env override lets us A/B "auto"/"trtllm-gen" during bring-up.
+        import os as _os
+
+        _motif_fi_backend = _os.environ.get("MOTIF_FLASHINFER_MLA_BACKEND", "cute-dsl")
         o = trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv_c_and_k_pe_cache.unsqueeze(1),
-            workspace_buffer=self._workspace_buffer,
+            # cute-dsl MLA kernel requires an int8 workspace; trtllm-gen used uint8.
+            # Same 1-byte element, so a view is free and lossless.
+            workspace_buffer=(
+                self._workspace_buffer.view(torch.int8)
+                if _motif_fi_backend == "cute-dsl"
+                else self._workspace_buffer
+            ),
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
@@ -199,6 +232,7 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             max_seq_len=attn_metadata.max_seq_len,
             bmm1_scale=self.bmm1_scale,
             bmm2_scale=self.bmm2_scale,
+            backend=_motif_fi_backend,
         )
 
         # Flatten the output for consistent shape

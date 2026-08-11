@@ -462,6 +462,7 @@ class EngineArgs:
     data_parallel_rpc_port: int | None = None
     data_parallel_hybrid_lb: bool = False
     data_parallel_external_lb: bool = False
+    data_parallel_multi_port_external_lb: bool = False
     data_parallel_backend: DataParallelBackend = ParallelConfig.data_parallel_backend
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
     enable_ep_weight_filter: bool = ParallelConfig.enable_ep_weight_filter
@@ -954,7 +955,9 @@ class EngineArgs:
             "-dpn",
             type=int,
             help="Data parallel rank of this instance. "
-            "When set, enables external load balancer mode.",
+            "When set, enables external load balancer mode for MoE "
+            "data-parallel deployments. Unsupported for non-MoE models; "
+            "launch independent vLLM instances instead.",
         )
         parallel_group.add_argument(
             "--data-parallel-start-rank",
@@ -996,6 +999,15 @@ class EngineArgs:
             "--data-parallel-external-lb",
             "-dpe",
             **parallel_kwargs["data_parallel_external_lb"],
+        )
+        parallel_group.add_argument(
+            "--data-parallel-multi-port-external-lb",
+            "-dpm",
+            action="store_true",
+            default=False,
+            help="Run a node-local supervisor that launches one external-LB API "
+            "server per local data parallel rank and exposes aggregated health on "
+            "a supervisor port.",
         )
         parallel_group.add_argument(
             "--enable-expert-parallel",
@@ -1765,6 +1777,16 @@ class EngineArgs:
         data_parallel_external_lb = (
             self.data_parallel_external_lb or self.data_parallel_rank is not None
         )
+        if (
+            self.data_parallel_size > 1
+            and data_parallel_external_lb
+            and not model_config.is_moe
+        ):
+            raise ValueError(
+                "Non-MoE models do not support external data parallel mode. "
+                "For external load balancing, launch independent vLLM "
+                "instances without --data-parallel-* arguments."
+            )
         # Local DP rank = 1, use pure-external LB.
         if data_parallel_external_lb:
             assert self.data_parallel_rank is not None, (

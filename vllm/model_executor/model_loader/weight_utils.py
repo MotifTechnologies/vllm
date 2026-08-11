@@ -372,6 +372,35 @@ def get_quant_config(
     # Inflight BNB quantization
     if model_config.quantization == "bitsandbytes":
         return quant_cls.from_config({})
+
+    # Inflight ModelOpt MXFP8 auto-conversion (--quantization modelopt_mxfp8
+    # against a bf16 checkpoint). See ModelOptMxFp8Config.from_config.
+    if model_config.quantization == "modelopt_mxfp8":
+        return quant_cls.from_config({"_mxfp8_dynamic": True})
+    # Same dynamic bf16-load path, DeepGEMM block-FP8 (1x128) MoE variant.
+    # See ModelOptBlockFp8Config.from_config.
+    if model_config.quantization == "modelopt_blockfp8":
+        return quant_cls.from_config({"_blockfp8_dynamic": True})
+    # CUTLASS NVFP4 MoE variant: direct load when the checkpoint was
+    # pre-quantized by tools/motif_nvfp4_quantize_ckpt.py (it declares
+    # quantization_config = {"quant_method": "modelopt_nvfp4"} in config.json,
+    # which also auto-selects this method without a --quantization flag);
+    # dynamic bf16->NVFP4 load-time quantization otherwise.
+    # See ModelOptNvFp4DynamicConfig.from_config.
+    if model_config.quantization == "modelopt_nvfp4":
+        hf_qcfg = getattr(model_config.hf_config, "quantization_config", None)
+        direct = (
+            isinstance(hf_qcfg, dict)
+            and hf_qcfg.get("quant_method") == "modelopt_nvfp4"
+        )
+        if load_config.load_format == "dummy":
+            # Dummy-format params are uninitialized garbage; direct-load
+            # validation (positive weight_scale_2 etc.) would reject them.
+            # The dynamic path quantizes whatever the dummy loader filled in.
+            direct = False
+        return quant_cls.from_config(
+            {"_nvfp4_dynamic": not direct, "_nvfp4_direct": direct}
+        )
     model_name_or_path = (
         maybe_download_from_modelscope(
             model_config.model,

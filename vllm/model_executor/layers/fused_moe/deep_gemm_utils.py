@@ -130,6 +130,8 @@ def _fwd_kernel_ep_scatter_2(
     HIDDEN_SIZE_PAD: tl.constexpr,
     SCALE_HIDDEN_SIZE: tl.constexpr,
     SCALE_HIDDEN_SIZE_PAD: tl.constexpr,
+    SCALE_PACKED: tl.constexpr,
+    SCALE_WORDS: tl.constexpr,
 ):
     start_token_id = tl.program_id(0)
     grid_num = tl.num_programs(0)
@@ -140,11 +142,23 @@ def _fwd_kernel_ep_scatter_2(
     offset_in_s = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
     mask_s = offset_in_s < SCALE_HIDDEN_SIZE
 
+    offset_in_w = tl.arange(0, SCALE_HIDDEN_SIZE_PAD // 4)
+    mask_w = offset_in_w < SCALE_WORDS
+
     for token_id in range(start_token_id, total_token_num, grid_num):
         to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
         to_copy_s = tl.load(
             recv_x_scale + token_id * recv_x_scale_stride0 + offset_in_s, mask=mask_s
         )
+        if SCALE_PACKED:
+            # Scales are UE8M0 (exact powers of two) — pack the fp32 exponent
+            # bytes into the int32 M-major layout DeepGEMM's SM100 1d1d kernel
+            # consumes directly (word[m, kw] = exponents of scales[m, 4kw:4kw+4],
+            # little-endian), skipping its transpose_and_pack kernel entirely.
+            exp_b = (to_copy_s.to(tl.uint32, bitcast=True) >> 23) & 0xFF
+            exp_b = tl.reshape(exp_b, (SCALE_HIDDEN_SIZE_PAD // 4, 4))
+            shifts = (tl.arange(0, 4) * 8)[None, :]
+            words = tl.sum(exp_b << shifts, axis=1).to(tl.int32, bitcast=True)
 
         for topk_index in tl.range(0, topk_num, 1, num_stages=4):
             expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
@@ -165,7 +179,17 @@ def _fwd_kernel_ep_scatter_2(
                     output_tensor_scale + dest_token_index * output_tensor_scale_stride0
                 )
                 tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
-                tl.store(output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s)
+                if SCALE_PACKED:
+                    tl.store(
+                        output_tensor_scale_ptr
+                        + offset_in_w * output_tensor_scale_stride1,
+                        words,
+                        mask=mask_w,
+                    )
+                else:
+                    tl.store(
+                        output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s
+                    )
 
 
 @torch.no_grad()
@@ -180,6 +204,7 @@ def ep_scatter(
     output_tensor_scale: torch.Tensor,
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
+    scale_packed: bool = False,
 ):
     BLOCK_E = 128  # token num of per expert is aligned to 128
     BLOCK_D = 128  # block size of quantization
@@ -232,7 +257,9 @@ def ep_scatter(
         HIDDEN_SIZE=hidden_size,
         HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
         SCALE_HIDDEN_SIZE=hidden_size // BLOCK_D,
-        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size // BLOCK_D),
+        SCALE_HIDDEN_SIZE_PAD=max(4, triton.next_power_of_2(hidden_size // BLOCK_D)),
+        SCALE_PACKED=scale_packed,
+        SCALE_WORDS=(hidden_size // BLOCK_D + 3) // 4,
     )
     return
 
@@ -341,6 +368,39 @@ def ep_gather(
     return
 
 
+@triton.jit
+def _fwd_kernel_expert_aligned_psum(
+    counts_ptr,
+    counts_i32_ptr,
+    psum_ptr,
+    E: tl.constexpr,
+    ALIGN: tl.constexpr,
+):
+    # Single-program inclusive scan over E (~48) experts. Replaces the eager
+    # add/floordiv/mul/cumsum/cast chain (~5 kernel launches) with one launch:
+    #   psum[e] = sum_{i<=e} align(counts[i]), counts_i32 = counts.int32
+    acc = 0
+    for e in range(E):
+        c = tl.load(counts_ptr + e).to(tl.int32)
+        tl.store(counts_i32_ptr + e, c)
+        acc += ((c + ALIGN - 1) // ALIGN) * ALIGN
+        tl.store(psum_ptr + e, acc)
+
+
+def expert_aligned_psum(
+    expert_num_tokens: torch.Tensor, align: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Returns (counts_int32, psum) where psum[e] is the cumulative
+    ALIGN-aligned end offset per expert (DeepGEMM psum-layout input)."""
+    E = expert_num_tokens.numel()
+    counts_i32 = torch.empty(E, dtype=torch.int32, device=expert_num_tokens.device)
+    psum = torch.empty(E, dtype=torch.int32, device=expert_num_tokens.device)
+    _fwd_kernel_expert_aligned_psum[(1,)](
+        expert_num_tokens, counts_i32, psum, E=E, ALIGN=align
+    )
+    return counts_i32, psum
+
+
 def deepgemm_moe_permute(
     aq: torch.Tensor,
     aq_scale: torch.Tensor,
@@ -349,6 +409,7 @@ def deepgemm_moe_permute(
     expert_map: torch.Tensor | None,
     expert_tokens_meta: mk.ExpertTokensMetadata | None,
     aq_out: torch.Tensor | None = None,
+    scale_packed: bool = False,
 ):
     assert aq.ndim == 2
     assert topk_ids.dtype.is_signed, "The kernel uses -1 to represent invalid topk_ids"
@@ -373,9 +434,19 @@ def deepgemm_moe_permute(
     if aq_out is None:
         aq_out = torch.empty((M_sum, H), device=device, dtype=aq.dtype)
 
-    aq_scale_out = torch.empty(
-        (M_sum, H // block_k), device=device, dtype=torch.float32
-    )
+    if scale_packed:
+        # DeepGEMM SM100 1d1d packed-UE8M0 activation-SF layout: logical
+        # (M_sum, ceil(K/128/4)) int32, M-major (stride (1, M_sum)) — what
+        # transform_sf_into_required_layout(recipe=(1,128), is_sfa=True)
+        # produces. Writing it directly in ep_scatter skips that kernel.
+        n_words = (H // block_k + 3) // 4
+        aq_scale_out = torch.empty(
+            (n_words, M_sum), device=device, dtype=torch.int32
+        ).t()
+    else:
+        aq_scale_out = torch.empty(
+            (M_sum, H // block_k), device=device, dtype=torch.float32
+        )
 
     # DeepGEMM uses negative values in m_indices (here expert_ids) to mark
     # completely invalid / padded blocks that should be skipped. We always
@@ -409,9 +480,10 @@ def deepgemm_moe_permute(
         output_tensor_scale=aq_scale_out,
         m_indices=expert_ids,
         output_index=inv_perm,
+        scale_packed=scale_packed,
     )
 
-    return aq_out, aq_scale_out, expert_ids, inv_perm
+    return aq_out, aq_scale_out, expert_ids, inv_perm, expert_num_tokens
 
 
 def deepgemm_unpermute_and_reduce(

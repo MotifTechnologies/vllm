@@ -1619,7 +1619,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 (
                     self.chunked_prefill_workspace_size
                     + self.chunked_prefill_workspace_size // self.dcp_world_size,
-                    self.model_config.get_head_size(),
+                    self.kv_cache_spec.head_size,
                 ),
                 dtype=self.model_config.dtype,
                 device=device,
@@ -1628,7 +1628,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             self.chunked_prefill_workspace = torch.empty(
                 (
                     self.chunked_prefill_workspace_size,
-                    self.model_config.get_head_size(),
+                    self.kv_cache_spec.head_size,
                 ),
                 dtype=self.q_data_type,
                 device=device,
@@ -2082,7 +2082,12 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             num_actual_tokens=num_tokens,
             query_start_loc=query_start_loc,
             slot_mapping=slot_mapping,
-            head_dim=self.model_config.get_head_size(),
+            # Use the MLA group's own kv_cache spec for head_dim, not
+            # model_config's global head_size. In a hybrid model (motif3 =
+            # MLA + SWA), the global get_head_size() may return the SWA QK
+            # head_dim, while the MLA group's spec correctly reports
+            # kv_lora_rank + qk_rope_head_dim.
+            head_dim=self.kv_cache_spec.head_size,
             # MLACommonMetadata Chunk prefill specific
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,

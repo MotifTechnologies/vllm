@@ -55,6 +55,11 @@ void sortAndScanExpert(const int* expert_for_source_row, const int* source_rows,
                        CubKeyValueSorter& sorter, void* sorter_ws,
                        cudaStream_t stream);
 
+void stableMapOnlyExpertSortLauncher(
+    const int* topk_ids, const int* expert_map, int* permuted_rows,
+    int64_t* expert_first_token_offset, int num_rows, int num_experts,
+    int num_experts_per_node, int topk, cudaStream_t stream);
+
 template <typename T>
 void expandInputRowsKernelLauncher(
     T const* unpermuted_input, T* permuted_output,

@@ -568,11 +568,15 @@ class GroupCoordinator:
             return self._reduce_scatter_out_place(input_, dim)
 
     def reduce_scatterv(
-        self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+        sizes: list[int] | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.reduce_scatterv(input_, dim, sizes)
+        return self.device_communicator.reduce_scatterv(input_, dim, sizes, out=out)
 
     def _reduce_scatter_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
         if self.device_communicator is None:

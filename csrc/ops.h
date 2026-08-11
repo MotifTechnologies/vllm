@@ -93,6 +93,44 @@ void rms_norm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rms_norm(torch::Tensor& input, torch::Tensor& residual,
                         torch::Tensor& weight, double epsilon);
 
+torch::Tensor grouped_poly_norm_forward(
+    torch::Tensor const& input,
+    torch::Tensor const& mul,
+    torch::Tensor const& weight,
+    torch::Tensor const& bias,
+    torch::Tensor const& topk_ids,
+    std::optional<torch::Tensor> const& expert_map,
+    int64_t top_k,
+    double eps,
+    double hidden_clamp);
+
+void grouped_poly_norm_nvfp4_quant(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& mul,
+    torch::Tensor const& weight,
+    torch::Tensor const& bias,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& blockscale_offsets,
+    torch::Tensor const& input_global_scale,
+    double eps,
+    double hidden_clamp,
+    double polynorm_output_scale);
+
+// motif3 DeepGEMM MoE: fused grouped PolyNorm + 1x128 FP8 requant (M2).
+std::tuple<torch::Tensor, torch::Tensor> grouped_poly_norm_fp8_quant(
+    torch::Tensor const& gate_up,
+    torch::Tensor const& weight,
+    torch::Tensor const& bias,
+    torch::Tensor const& group_ids,
+    double eps,
+    double hidden_clamp,
+    double polynorm_output_scale,
+    bool use_ue8m0,
+    bool packed_scale);
+
+
 void fused_qk_norm_rope(torch::Tensor& qkv, int64_t num_heads_q,
                         int64_t num_heads_k, int64_t num_heads_v,
                         int64_t head_dim, double eps, torch::Tensor& q_weight,

@@ -293,6 +293,8 @@ set(VLLM_EXT_SRC
   "csrc/pos_encoding_kernels.cu"
   "csrc/activation_kernels.cu"
   "csrc/layernorm_kernels.cu"
+  "csrc/grouped_poly_norm_kernel.cu"
+  "csrc/motif_fused_poly_quant_kernel.cu"
   "csrc/fused_qknorm_rope_kernel.cu"
   "csrc/layernorm_quant_kernels.cu"
   "csrc/sampler.cu"
@@ -969,6 +971,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       SRCS "${NVFP4_KV_SRC}"
       CUDA_ARCHS "${FP4_ARCHS}")
     target_sources(_C PRIVATE ${NVFP4_KV_SRC})
+    set(GROUPED_POLY_NORM_NVFP4_SRC
+      "csrc/grouped_poly_norm_nvfp4_quant_kernel.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${GROUPED_POLY_NORM_NVFP4_SRC}"
+      CUDA_ARCHS "${FP4_ARCHS}")
+    target_sources(_C PRIVATE ${GROUPED_POLY_NORM_NVFP4_SRC})
     target_compile_definitions(_C PRIVATE ENABLE_NVFP4_SM100=1)
     list(APPEND VLLM_GPU_FLAGS "-DENABLE_NVFP4_SM100=1")
     list(APPEND VLLM_GPU_FLAGS "-DENABLE_CUTLASS_MOE_SM100=1")

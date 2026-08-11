@@ -17,6 +17,8 @@ QuantizationMethods = Literal[
     "modelopt",
     "modelopt_fp4",
     "modelopt_mxfp8",
+    "modelopt_blockfp8",
+    "modelopt_nvfp4",
     "modelopt_mixed",
     "gguf",
     "gptq_marlin",
@@ -132,10 +134,12 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .humming import HummingConfig
     from .inc import INCConfig
     from .modelopt import (
+        ModelOptBlockFp8Config,
         ModelOptFp8Config,
         ModelOptMixedPrecisionConfig,
         ModelOptMxFp8Config,
         ModelOptNvFp4Config,
+        ModelOptNvFp4DynamicConfig,
     )
     from .moe_wna16 import MoeWNA16Config
     from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
@@ -150,6 +154,8 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "modelopt": ModelOptFp8Config,
         "modelopt_fp4": ModelOptNvFp4Config,
         "modelopt_mxfp8": ModelOptMxFp8Config,
+        "modelopt_blockfp8": ModelOptBlockFp8Config,
+        "modelopt_nvfp4": ModelOptNvFp4DynamicConfig,
         "modelopt_mixed": ModelOptMixedPrecisionConfig,
         "gguf": GGUFConfig,
         "gptq_marlin": GPTQMarlinConfig,

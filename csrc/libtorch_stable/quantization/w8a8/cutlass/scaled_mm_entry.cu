@@ -100,7 +100,8 @@ void get_cutlass_moe_mm_problem_sizes_from_expert_offsets_caller(
     const torch::stable::Tensor& expert_first_token_offset,
     torch::stable::Tensor& problem_sizes1,
     torch::stable::Tensor& problem_sizes2, const int64_t n, const int64_t k,
-    const bool swap_ab);
+    const bool swap_ab, torch::stable::Tensor* expert_offsets,
+    torch::stable::Tensor* blockscale_offsets);
 
 void get_cutlass_batched_moe_mm_data_caller(
     torch::stable::Tensor& expert_offsets,
@@ -336,13 +337,37 @@ void get_cutlass_moe_mm_problem_sizes_from_expert_offsets(
     (defined ENABLE_CUTLASS_MOE_SM100 && ENABLE_CUTLASS_MOE_SM100) || \
     (defined ENABLE_CUTLASS_MOE_SM120 && ENABLE_CUTLASS_MOE_SM120)
   get_cutlass_moe_mm_problem_sizes_from_expert_offsets_caller(
-      expert_first_token_offset, problem_sizes1, problem_sizes2, n, k, swap_ab);
+      expert_first_token_offset, problem_sizes1, problem_sizes2, n, k, swap_ab,
+      nullptr, nullptr);
   return;
 #endif
   STD_TORCH_CHECK_NOT_IMPLEMENTED(
       false,
       "No compiled get_cutlass_moe_mm_problem_sizes_from_expert_offsets: "
       "no cutlass_scaled_mm kernel for CUDA device capability: ",
+      version_num, ". Required capability: 90, 100, or 120");
+}
+
+void get_cutlass_moe_mm_problem_sizes_and_nvfp4_offsets(
+    const torch::stable::Tensor& expert_first_token_offset,
+    torch::stable::Tensor& problem_sizes1,
+    torch::stable::Tensor& problem_sizes2,
+    torch::stable::Tensor& expert_offsets,
+    torch::stable::Tensor& blockscale_offsets, const int64_t n,
+    const int64_t k) {
+  int32_t version_num = get_sm_version_num();
+#if (defined ENABLE_CUTLASS_MOE_SM90 && ENABLE_CUTLASS_MOE_SM90) ||   \
+    (defined ENABLE_CUTLASS_MOE_SM100 && ENABLE_CUTLASS_MOE_SM100) || \
+    (defined ENABLE_CUTLASS_MOE_SM120 && ENABLE_CUTLASS_MOE_SM120)
+  get_cutlass_moe_mm_problem_sizes_from_expert_offsets_caller(
+      expert_first_token_offset, problem_sizes1, problem_sizes2, n, k, false,
+      &expert_offsets, &blockscale_offsets);
+  return;
+#endif
+  STD_TORCH_CHECK_NOT_IMPLEMENTED(
+      false,
+      "No compiled get_cutlass_moe_mm_problem_sizes_and_nvfp4_offsets: "
+      "no CUTLASS MoE kernel for CUDA device capability: ",
       version_num, ". Required capability: 90, 100, or 120");
 }
 

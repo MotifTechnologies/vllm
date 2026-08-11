@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import vllm.kernels  # noqa: F401
 from vllm import _oink_ops, envs, ir
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import (
@@ -84,6 +85,91 @@ def poly_norm(
         variance_epsilon,
     )
     return out
+
+
+@CustomOp.register("poly_norm")
+class PolyNorm(CustomOp):
+    """Polynomial normalization.
+
+    Computes x -> w_0 * RMSNorm(x^3) + w_1 * RMSNorm(x^2) + w_2 * RMSNorm(x) + b
+    where w_n is the learned weight and b is the bias.
+    Refer to https://arxiv.org/html/2411.03884v1
+
+    When tp_size > 1, partial statistics are all-reduced across TP ranks so
+    that normalization is computed over the full hidden dimension.
+    """
+
+    def __init__(
+        self,
+        tp_size: int = 1,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.tp_size = tp_size
+        self.weight = torch.nn.Parameter(torch.ones(3) / 3)
+        self.bias = torch.nn.Parameter(torch.zeros(1))
+        self.variance_epsilon = eps
+
+
+    def _norm2(self, x: torch.Tensor) -> torch.Tensor:
+        return x / torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
+
+
+    def _norm(self, x: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
+        return x / torch.sqrt(mean + self.variance_epsilon)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # When tp_size > 1, delegate to forward_native which all-reduces partial
+        # statistics so that normalization is computed over the full hidden dim.
+        if self.tp_size > 1:
+            return self.forward_native(x)
+        # Upcast to float32 to match PolyNormKernel (which computes internally in float32)
+        orig_dtype = x.dtype
+        x = x.float()
+        out = (
+            self.weight[0].float() * self._norm2(x ** 3)
+            + self.weight[1].float() * self._norm2(x ** 2)
+            + self.weight[2].float() * self._norm2(x)
+            + self.bias.float()
+        )
+        return out.to(orig_dtype)
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x_float = x.to(torch.float32)
+        x_2 = x_float.pow(2)
+        x_2_sum = x_2.sum(-1, keepdim=True)
+        x_3 = x_2 * x_float
+        x_4_sum = (x_2 * x_2).sum(-1, keepdim=True)
+        x_6_sum = (x_3 * x_3).sum(-1, keepdim=True)
+        H = x.shape[-1]
+        if self.tp_size > 1:
+            reducee = torch.cat([x_2_sum, x_4_sum, x_6_sum], dim=-1)
+            reducee = tensor_model_parallel_all_reduce(reducee)
+            x_2_sum, x_4_sum, x_6_sum = torch.split(reducee, 1, dim=-1)
+            H *= self.tp_size
+        x_2_mean = x_2_sum / H
+        x_4_mean = x_4_sum / H
+        x_6_mean = x_6_sum / H
+        output = (
+            self.weight[0] * self._norm(x_3, x_6_mean)
+            + self.weight[1] * self._norm(x_2, x_4_mean)
+            + self.weight[2] * self._norm(x_float, x_2_mean)
+            + self.bias
+        )
+        return output.to(orig_dtype)
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.tp_size > 1:
+            return self.forward_native(x)
+        else:
+            return self.forward(x)# self.weight, self.bias, self.variance_epsilon)
 
 
 def dispatch_rocm_rmsnorm_func(dtype: torch.dtype, use_aiter: bool = False):

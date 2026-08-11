@@ -250,6 +250,83 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
   }
 }
 
+// Motif's first expert GEMM consumes expert-contiguous output while its input
+// remains token-major. Keep this gather path separate from the stock expert
+// quantization kernels above.
+template <class Type>
+__global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
+    cvt_fp16_to_fp4_permuted(
+        int32_t numRows, int32_t numCols, Type const* in,
+        float const* SFScale, uint32_t* out, uint32_t* SFout,
+        uint32_t const* input_offset_by_experts,
+        uint32_t const* output_scale_offset_by_experts, int n_experts,
+        int32_t const* permuted_idx, int32_t* inv_permuted_idx, int topk) {
+  using PackedVec = PackedVec<Type, CVT_FP4_PACK16>;
+  static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
+      CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
+  int32_t const numKTiles = (numCols + 63) / 64;
+  int const colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
+
+  int const tid = blockIdx.x * blockDim.x + threadIdx.x;
+  for (int globalIdx = tid; globalIdx < numRows * colsPerRow;
+       globalIdx += gridDim.x * blockDim.x) {
+    int const rowIdx = globalIdx / colsPerRow;
+    int const colIdx = globalIdx % colsPerRow;
+
+    int rowIdx_in_expert = 0;
+    // Under expert parallelism the rows past the last local expert offset
+    // belong to no expert: their tokens were routed to a rank that does not
+    // own them. The search below must report that instead of falling through
+    // with its initial value — expert 0, row 0 — which would make every such
+    // row overwrite the first expert's first scale slot and corrupt a real
+    // row's GEMM input. (A world_size=1 run has no unassigned rows, so this
+    // only shows up with EP.)
+    int expert_idx = -1;
+    int left = 0;
+    int right = n_experts - 1;
+    while (left <= right) {
+      int const mid = (left + right) / 2;
+      uint32_t const current_offset =
+          __ldg(&input_offset_by_experts[mid]);
+      uint32_t const next_offset =
+          __ldg(&input_offset_by_experts[mid + 1]);
+      if (rowIdx >= current_offset && rowIdx < next_offset) {
+        rowIdx_in_expert = rowIdx - current_offset;
+        expert_idx = mid;
+        break;
+      }
+      if (rowIdx < current_offset) {
+        right = mid - 1;
+      } else {
+        left = mid + 1;
+      }
+    }
+    if (expert_idx < 0) {
+      continue;
+    }
+
+    int const expanded_source_row = __ldg(&permuted_idx[rowIdx]);
+    int const source_row = expanded_source_row / topk;
+    if (colIdx == 0) {
+      inv_permuted_idx[expanded_source_row] = rowIdx;
+    }
+
+    int64_t const inOffset = source_row * colsPerRow + colIdx;
+    PackedVec quant_input = reinterpret_cast<PackedVec const*>(in)[inOffset];
+    int64_t const outOffset = rowIdx * colsPerRow + colIdx;
+    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[expert_idx];
+    uint32_t* SFout_in_expert =
+        SFout + output_scale_offset_by_experts[expert_idx] * numKTiles;
+    auto sf_out =
+        cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                           CVT_FP4_NUM_THREADS_PER_SF>(
+            rowIdx_in_expert, colIdx, numKTiles, SFout_in_expert);
+    out[outOffset] =
+        cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, false>(
+            quant_input, SFScaleVal, sf_out);
+  }
+}
+
 template <typename T, bool FUSE_SILU_MUL = false>
 void quant_impl(void* output, void* output_scale, void* input,
                 void* input_global_scale, void* input_offset_by_experts,
@@ -325,6 +402,37 @@ void quant_impl(void* output, void* output_scale, void* input,
               n_experts, /* bool low_latency */ true);
     }
   }
+}
+
+template <typename T>
+void quant_permuted_impl(
+    void* output, void* output_scale, void* input, void* input_global_scale,
+    void* input_offset_by_experts, void* output_scale_offset_by_experts,
+    int m_topk, int k, int n_experts, cudaStream_t stream, void* permuted_idx,
+    void* inv_permuted_idx, int topk) {
+  int const multiProcessorCount =
+      get_device_attribute(cudaDevAttrMultiProcessorCount, -1);
+  int const workSizePerRow = k / ELTS_PER_THREAD;
+  int const totalWorkSize = m_topk * workSizePerRow;
+  dim3 block(std::min(workSizePerRow, 512));
+  int const numBlocksPerSM =
+      vllm_runtime_blocks_per_sm(static_cast<int>(block.x));
+  dim3 grid(std::min(static_cast<int>((totalWorkSize + block.x - 1) / block.x),
+                     multiProcessorCount * numBlocksPerSM));
+  while (grid.x <= multiProcessorCount && block.x > 64) {
+    grid.x *= 2;
+    block.x = (block.x + 1) / 2;
+  }
+
+  cvt_fp16_to_fp4_permuted<T><<<grid, block, 0, stream>>>(
+      m_topk, k, reinterpret_cast<T*>(input),
+      reinterpret_cast<float*>(input_global_scale),
+      reinterpret_cast<uint32_t*>(output),
+      reinterpret_cast<uint32_t*>(output_scale),
+      reinterpret_cast<uint32_t*>(input_offset_by_experts),
+      reinterpret_cast<uint32_t*>(output_scale_offset_by_experts), n_experts,
+      reinterpret_cast<int32_t const*>(permuted_idx),
+      reinterpret_cast<int32_t*>(inv_permuted_idx), topk);
 }
 
 }  // namespace vllm
@@ -416,6 +524,47 @@ void scaled_fp4_experts_quant_sm1xxa(
             input_global_scale.data_ptr(), input_offset_by_experts.data_ptr(),
             output_scale_offset_by_experts.data_ptr(), m_topk, k, n_experts,
             stream);
+      });
+}
+
+void scaled_fp4_experts_quant_permuted_sm1xxa(
+    torch::stable::Tensor& output, torch::stable::Tensor& output_scale,
+    torch::stable::Tensor const& input,
+    torch::stable::Tensor const& input_global_scale,
+    torch::stable::Tensor const& input_offset_by_experts,
+    torch::stable::Tensor const& output_scale_offset_by_experts,
+    torch::stable::Tensor const& permuted_idx,
+    torch::stable::Tensor& inv_permuted_idx, int64_t topk) {
+  auto m_topk = output.size(0);
+  auto k = input.size(1);
+
+  validate_fp4_experts_quant_inputs(output, output_scale, input,
+                                    input_global_scale, input_offset_by_experts,
+                                    output_scale_offset_by_experts, m_topk, k);
+  CHECK_INPUT(permuted_idx, "permuted_idx");
+  CHECK_INPUT(inv_permuted_idx, "inv_permuted_idx");
+  STD_TORCH_CHECK(permuted_idx.dim() == 1);
+  STD_TORCH_CHECK(inv_permuted_idx.dim() == 1);
+  STD_TORCH_CHECK(permuted_idx.scalar_type() == INT);
+  STD_TORCH_CHECK(inv_permuted_idx.scalar_type() == INT);
+  STD_TORCH_CHECK(permuted_idx.size(0) == m_topk);
+  STD_TORCH_CHECK(inv_permuted_idx.size(0) == m_topk);
+  STD_TORCH_CHECK(topk > 0);
+  STD_TORCH_CHECK(input.size(0) * topk == m_topk);
+
+  auto n_experts = input_global_scale.size(0);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      input.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(input.get_device_index());
+
+  VLLM_STABLE_DISPATCH_HALF_TYPES(
+      input.scalar_type(), "nvfp4_experts_quant_permuted_kernel", [&] {
+        using cuda_type = vllm::CUDATypeConverter<scalar_t>::Type;
+        vllm::quant_permuted_impl<cuda_type>(
+            output.data_ptr(), output_scale.data_ptr(), input.data_ptr(),
+            input_global_scale.data_ptr(), input_offset_by_experts.data_ptr(),
+            output_scale_offset_by_experts.data_ptr(), m_topk, k, n_experts,
+            stream, permuted_idx.data_ptr(), inv_permuted_idx.data_ptr(), topk);
       });
 }
 

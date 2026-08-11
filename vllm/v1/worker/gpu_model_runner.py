@@ -641,6 +641,9 @@ class GPUModelRunner(
             # uses output token ids so we set this conservatively.
             # ThinkingTokenBudgetLogitsProcessor also needs output token ids to
             # correctly track think start/end token sequences in async scheduling.
+            # RepetitionGuardLogitsProcessor scans recent output tokens
+            # too, but it is think-only, so reasoning being configured already
+            # covers every request that could arm it.
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs)
             or self.vllm_config.reasoning_config is not None,
             is_pooling_model=self.is_pooling_model,
@@ -3565,6 +3568,7 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        has_invalid_spec_tokens: bool = False,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3606,7 +3610,10 @@ class GPUModelRunner(
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-            num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
+            num_tokens_padded,
+            disable_full=use_cascade_attn
+            or has_encoder_output
+            or has_invalid_spec_tokens,
         )
         num_tokens_padded = batch_descriptor.num_tokens
         if self.compilation_config.pass_config.enable_sp:
@@ -3900,6 +3907,12 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                has_invalid_spec_tokens=any(
+                    -1 in toks
+                    for toks in (
+                        scheduler_output.scheduled_spec_decode_tokens.values()
+                    )
+                ),
             )
 
             logger.debug(
@@ -5262,6 +5275,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        is_dp_idle_sync: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5289,6 +5303,9 @@ class GPUModelRunner(
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
+            is_dp_idle_sync: True only for the per-step dummy runs on idle DP
+                ranks (execute_dummy_batch). Lets the drafter portion be
+                skipped when the draft model runs no DP-wide collectives.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -5584,12 +5601,22 @@ class GPUModelRunner(
                 ):
                     use_cudagraphs = False
 
-                self.drafter.dummy_run(
-                    num_tokens,
-                    use_cudagraphs=use_cudagraphs,
-                    is_graph_capturing=is_graph_capturing,
-                    slot_mappings=slot_mappings,
-                )
+                # MOTIF: when the dense drafter skips DP batch coordination,
+                # idle-rank per-step dummies have no drafter collective to
+                # pair with, so their draft forwards are pure waste — skip
+                # them so idle ranks reach the next step's main-model
+                # rendezvous sooner. Startup warmup/capture paths (and MoE
+                # drafters, which still coordinate) keep running.
+                if not (
+                    is_dp_idle_sync
+                    and getattr(self.drafter, "skip_draft_dp_coordination", False)
+                ):
+                    self.drafter.dummy_run(
+                        num_tokens,
+                        use_cudagraphs=use_cudagraphs,
+                        is_graph_capturing=is_graph_capturing,
+                        slot_mappings=slot_mappings,
+                    )
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
         # done to avoid nvtx operations in hook functions being traced by

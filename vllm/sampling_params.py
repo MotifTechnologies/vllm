@@ -7,7 +7,7 @@ import json as json_mod
 from dataclasses import field
 from enum import Enum, IntEnum
 from functools import cached_property
-from typing import Any
+from typing import Any, Literal
 
 import msgspec
 from pydantic.dataclasses import dataclass
@@ -125,6 +125,33 @@ class RepetitionDetectionParams:
     detection. Must be >= 2. Example: 3 for detecting a phrase repeated
     3 times. Must be used together with max_pattern_size."""
 
+    # logits-level repetition guard (RepetitionGuardLogitsProcessor).
+    # When `mode` is set, repetition is detected pre-sampling over a recent
+    # window of output tokens (suffix array + LCP, variable-length patterns,
+    # overlapping/tandem loops included) and generation is STEERED instead of
+    # killed. Mutually exclusive with the scheduler-level detection above
+    # (max_pattern_size > 0), which hard-stops the request.
+    mode: Literal["truncate"] | None = None
+    """logits-level guard mode. None disables the guard.
+    The guard is THINK-ONLY: it detects and intervenes strictly inside the
+    thinking section and never touches the answer section (requires
+    reasoning to be enabled).
+    "truncate": force the reasoning end sequence
+    (VLLM_THINK_BUDGET_FORCE_STR or the bare reasoning end tokens) so the
+    model exits the loop and still produces an answer.
+    Every knob follows priority chain vllm_xargs > this field >
+    env var > default. Activation: vllm_xargs.rep_trunc_mode > this field
+    > VLLM_REP_MODE env > off. The trigger is coverage-based
+    (vllm_xargs.rep_coverage > VLLM_REP_COVERAGE > 0.5) with an
+    occurrence floor of vllm_xargs.rep_min_count > `min_count` (>= 2) >
+    int(VLLM_REP_MAX) + 1 > 3; the minimum pattern length is
+    vllm_xargs.rep_min_pattern_size > `min_pattern_size` >
+    VLLM_REP_MIN_LEN > 5."""
+
+    scope: Literal["think"] | None = None
+    """retained for surface compatibility; the guard is think-only,
+    so "think" is the only accepted value."""
+
     def __post_init__(self):
         if (
             self.max_pattern_size < 0
@@ -142,6 +169,26 @@ class RepetitionDetectionParams:
                 "in engine output. If you do not wish to detect repetitive "
                 "patterns, set max_pattern_size to 0."
             )
+        # logits-level guard validation.
+        if self.scope is not None and self.mode is None:
+            raise ValueError(
+                "repetition_detection.scope requires repetition_detection.mode "
+                "to be set."
+            )
+        if self.mode is not None:
+            if self.max_pattern_size > 0:
+                raise ValueError(
+                    "repetition_detection.mode (logits-level repetition guard) "
+                    "is mutually exclusive with scheduler-level repetition "
+                    "detection (max_pattern_size > 0). Set max_pattern_size "
+                    "to 0."
+                )
+            if self.min_count == 1:
+                raise ValueError(
+                    "repetition_detection.min_count must be 0 (use the server "
+                    "default derived from VLLM_REP_MAX) or >= 2 when mode is "
+                    "set."
+                )
 
 
 class RequestOutputKind(Enum):

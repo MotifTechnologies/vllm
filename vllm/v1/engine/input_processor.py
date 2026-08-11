@@ -107,6 +107,40 @@ class InputProcessor:
                     "not configured. Please set --reasoning-config to use "
                     "thinking_token_budget."
                 )
+
+            # logits-level repetition guard and think-budget xargs,
+            # configured via typed request fields or vllm_xargs with the
+            # priority chain vllm_xargs > request field > env > default
+            # (nothing applies unless explicitly requested). The resolvers
+            # raise ValueError on malformed vllm_xargs values so clients get
+            # a 400 instead of a silent no-op.
+            from vllm.v1.sample.logits_processor.repetition import (
+                resolve_rep_guard_request_config,
+            )
+            from vllm.v1.sample.logits_processor.think_budget import (
+                validate_think_budget_xargs,
+            )
+
+            reasoning_on = (
+                self.vllm_config.reasoning_config is not None
+                and self.vllm_config.reasoning_config.enabled
+            )
+            validate_think_budget_xargs(params, reasoning_on)
+            rep_config = resolve_rep_guard_request_config(params)
+            # The guard is think-only, so it requires reasoning. This is a
+            # 400 only when the REQUEST opted in; the VLLM_REP_MODE
+            # server-wide default degrades silently instead (the processor
+            # warned at startup).
+            if (
+                rep_config is not None
+                and rep_config["source"] == "request"
+                and not reasoning_on
+            ):
+                raise ValueError(
+                    "The repetition guard is think-only and requires "
+                    "reasoning to be enabled (--reasoning-parser); this "
+                    "server has no thinking section to guard."
+                )
         elif isinstance(params, PoolingParams):
             supported_pooling_tasks = [
                 task for task in supported_tasks if task in POOLING_TASKS

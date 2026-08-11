@@ -8,7 +8,7 @@ import math
 import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, NewType, TypeAlias, cast, overload
 
@@ -881,9 +881,12 @@ def get_max_concurrency_for_kv_cache_config(
     max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
         vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
     )
-    memory_per_block = (
-        kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        * num_layer_per_group
+    # Sum across groups so hybrid models with different page_size per group
+    # (e.g. motif3 MLA latent + GQA SWA) are counted correctly. For the
+    # single-group uniform case this equals `num_layer_per_group * page_size`.
+    memory_per_block = sum(
+        len(group.layer_names) * group.kv_cache_spec.page_size_bytes
+        for group in kv_cache_config.kv_cache_groups
     )
     num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
     max_concurrency = kv_cache_config.num_blocks / num_block_per_request
@@ -1002,46 +1005,6 @@ def is_kv_cache_page_size_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool
 
     page_sizes = {layer.page_size_bytes for layer in kv_cache_spec.values()}
     return len(page_sizes) == 1
-
-
-def unify_kv_cache_spec_page_size(
-    kv_cache_spec: dict[str, KVCacheSpec],
-) -> dict[str, KVCacheSpec]:
-    """
-    Unify the page size of the given KVCacheSpec. If the page size of all layers
-    are the same, return the original KVCacheSpec. If not same, unify the page
-    size by increasing the block size of layers with smaller page size. Raise
-    NotImplementedError if failed to unify the page size.
-
-    Args:
-        kv_cache_spec: The KVCacheSpec of each attention layer in the model
-
-    Returns:
-        The updated KVCacheSpec with the same page_size_bytes.
-    """
-    page_sizes = {layer.page_size_bytes for layer in kv_cache_spec.values()}
-    if len(page_sizes) <= 1:
-        # All layers have the same page size, no need to unify.
-        return kv_cache_spec
-
-    max_page_size = max(page_sizes)
-    new_kv_cache_spec = {}
-    for layer_name, layer_spec in kv_cache_spec.items():
-        if layer_spec.page_size_bytes == max_page_size:
-            new_kv_cache_spec[layer_name] = layer_spec
-        else:
-            layer_page_size = layer_spec.page_size_bytes
-            if max_page_size % layer_page_size != 0:
-                raise NotImplementedError(
-                    "The page size of the layer is not divisible by the "
-                    "maximum page size. Cannot unify by adjusting block_size."
-                )
-            ratio = max_page_size // layer_page_size
-            new_block_size = layer_spec.block_size * ratio
-            new_spec = replace(layer_spec, block_size=new_block_size)
-            assert new_spec.page_size_bytes == max_page_size
-            new_kv_cache_spec[layer_name] = new_spec
-    return new_kv_cache_spec
 
 
 def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
@@ -1281,6 +1244,37 @@ def get_kv_cache_config_from_groups(
         num_blocks, kv_cache_tensors = _get_kv_cache_config_deepseek_v4(
             vllm_config, kv_cache_groups, available_memory
         )
+    elif len({g.kv_cache_spec.page_size_bytes for g in kv_cache_groups}) > 1:
+        # Hybrid case with different page_size per bucket (e.g. motif3 MLA +
+        # GQA SWA). Bucket groups by page_size: within a bucket, all groups
+        # have the same page_size and can cross-share a single KVCacheTensor
+        # (same trick as the general-case else branch). Different buckets get
+        # separate tensors. All buckets share the same num_blocks so the
+        # block-table index is comparable across groups, and per-block memory
+        # is the sum of (max_group_size_in_bucket × page_size) across buckets —
+        # this mirrors `group_size × page_size` of the single-page case,
+        # generalized for multiple page sizes.
+        by_page: dict[int, list[KVCacheGroupSpec]] = defaultdict(list)
+        for g in kv_cache_groups:
+            by_page[g.kv_cache_spec.page_size_bytes].append(g)
+        per_block_total = sum(
+            max(len(g.layer_names) for g in bucket) * page_size
+            for page_size, bucket in by_page.items()
+        )
+        assert per_block_total > 0, "per_block_total must be greater than 0"
+        num_blocks = int(available_memory // per_block_total)
+        num_blocks = max(num_blocks, 0)
+        num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+        kv_cache_tensors = []
+        for page_size, bucket in by_page.items():
+            bucket_group_size = max(len(g.layer_names) for g in bucket)
+            for i in range(bucket_group_size):
+                shared_by = [
+                    g.layer_names[i] for g in bucket if i < len(g.layer_names)
+                ]
+                kv_cache_tensors.append(
+                    KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+                )
     else:
         # General case:
         # We will have group_size memory pools, each is shared by one layer from
@@ -1308,6 +1302,50 @@ def get_kv_cache_config_from_groups(
             kv_cache_tensors.append(
                 KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
             )
+
+    # Motif MTP spec-decode KV isolation: ensure the draft model's attention
+    # layers ("mtp_block") never share a physical KVCacheTensor with base-model
+    # layers. The page_size bucketing above can still co-locate a draft layer
+    # with base layers (same page_size); split it into its own tensor so the
+    # draft's separate block table cannot corrupt the base layers' KV.
+    # (Correctness over memory — the system team can re-optimize the sharing.)
+    def _is_draft(name: str) -> bool:
+        return "mtp_block" in name
+
+    if num_blocks > 0 and any(
+        _is_draft(n) for t in kv_cache_tensors for n in t.shared_by
+    ):
+        # Split draft layers out into their own tensors. Each tensor's size is
+        # page_size * num_blocks, so page_size = size // num_blocks. Isolating a
+        # draft layer adds an extra (unshared) tensor, so recompute num_blocks
+        # from the new per-block byte total to stay within available_memory
+        # (otherwise the extra tensor OOMs).
+        split: list[tuple[int, list[str]]] = []  # (page_size_bytes, shared_by)
+        for t in kv_cache_tensors:
+            ps = t.size // num_blocks
+            base = [n for n in t.shared_by if not _is_draft(n)]
+            draft = [n for n in t.shared_by if _is_draft(n)]
+            if draft and base:
+                split.append((ps, base))
+                for d in draft:
+                    split.append((ps, [d]))
+            else:
+                split.append((ps, t.shared_by))
+        per_block_total = sum(ps for ps, _ in split)
+        new_num_blocks = num_blocks
+        if per_block_total > 0:
+            new_num_blocks = may_override_num_blocks(
+                vllm_config, max(0, int(available_memory // per_block_total))
+            )
+        kv_cache_tensors = [
+            KVCacheTensor(size=ps * new_num_blocks, shared_by=sb) for ps, sb in split
+        ]
+        logger.info(
+            "[MTP-KV-ISOLATION] isolated draft KV tensors; num_blocks %d -> %d",
+            num_blocks,
+            new_num_blocks,
+        )
+        num_blocks = new_num_blocks
 
     return KVCacheConfig(
         num_blocks=num_blocks,
@@ -1648,15 +1686,72 @@ def get_kv_cache_groups(
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
 
-    # As KVCacheManager can only allocate memory of one size, we need to unify
-    # the page size of the layers. For cases cannot be unified, this function
-    # will raise an error.
-    kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
-    # Model contains multiple attention types, but KV cache of all layers
-    # have the same physical memory per block per layer. Split the layers
-    # into groups with the same number of layers, and thus same total page
-    # size.
-    return _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
+    if is_kv_cache_page_size_uniform(kv_cache_spec):
+        # Hybrid attention types but all layers happen to share the same
+        # physical page size — the existing uniform-page-size path handles
+        # this with one shared memory pool.
+        return _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
+
+    # Hybrid model with different page sizes per attention type (e.g. motif3:
+    # MLA latent cache + GQA SWA). Partition layers by spec type so each
+    # partition has uniform page_size; then split each partition into
+    # sub-groups. This mirrors _get_kv_cache_groups_uniform_page_size's
+    # per-type split and restores cross-group KVCacheTensor sharing within
+    # each partition (get_kv_cache_config_from_groups buckets groups by
+    # page_size and shares one tensor across same-bucket groups).
+    # Motif MTP spec-decode KV isolation: keep the draft model's attention
+    # layers (name contains "mtp_block") in their OWN partition so they get a
+    # dedicated KV cache group (and block table), never co-partitioned with the
+    # base model's same-type (SWA) layers. Sharing corrupts base KV because the
+    # draft runs its forward with a separate block table.
+    by_type: dict[tuple, dict[str, KVCacheSpec]] = defaultdict(dict)
+    for layer_name, layer_spec in kv_cache_spec.items():
+        by_type[(type(layer_spec), "mtp_block" in layer_name)][layer_name] = layer_spec
+
+    groups: list[KVCacheGroupSpec] = []
+    for partition in by_type.values():
+        partition_layer_names = list(partition.keys())
+        n_layers = len(partition_layer_names)
+        sample_spec = next(iter(partition.values()))
+        if isinstance(sample_spec, SlidingWindowSpec):
+            # Sliding-window-evictable spec: smaller sub-groups give better
+            # cross-share amortization at minimal per_seq cost — each sub-group
+            # keeps only ~ceil(sliding_window/block_size)+1 active blocks per
+            # sequence under the sliding-window manager. Tunable via
+            # VLLM_HYBRID_SWA_NUM_SUBGROUPS (default 13, which puts motif3's
+            # 39 SWA layers into 13 sub-groups of 3).
+            target_num_sub_groups = int(
+                os.getenv("VLLM_HYBRID_SWA_NUM_SUBGROUPS", "13")
+            )
+            target_sub_group_size = max(1, cdiv(n_layers, target_num_sub_groups))
+            logger.info(
+                "SWA partition: %d layers split into %d sub-groups "
+                "(sub-group size %d, VLLM_HYBRID_SWA_NUM_SUBGROUPS=%d)",
+                n_layers,
+                cdiv(n_layers, target_sub_group_size),
+                target_sub_group_size,
+                target_num_sub_groups,
+            )
+        else:
+            # Full-attention-semantic spec (MLAAttentionSpec, FullAttentionSpec,
+            # etc.) has no per-group active-block cap, so any split linearly
+            # multiplies slot_per_seq without enough page_size amortization to
+            # compensate. 1 group is always optimal — size sub-group = n_layers.
+            target_sub_group_size = n_layers
+        num_sub_groups = cdiv(n_layers, target_sub_group_size)
+        if num_sub_groups > 1 and n_layers % num_sub_groups != 0:
+            num_padding = num_sub_groups - (n_layers % num_sub_groups)
+            logger.warning(
+                "Add %d padding layers, may waste at most %.2f%% KV cache memory",
+                num_padding,
+                num_padding / n_layers * 100,
+            )
+        # Interleaved assignment (PP-friendly; matches uniform_page_size path).
+        grouped_layer_lists = [
+            partition_layer_names[i::num_sub_groups] for i in range(num_sub_groups)
+        ]
+        groups.extend(create_kv_cache_group_specs(partition, grouped_layer_lists))
+    return groups
 
 
 def generate_scheduler_kv_cache_config(
@@ -1761,6 +1856,17 @@ def _max_memory_usage_bytes_from_groups(
             )
             total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
         return total_max_mem_usage_bytes
+
+    # Multi-page-size hybrid (e.g. motif3 MLA + GQA SWA): pools are bucketed
+    # by page_size in get_kv_cache_config_from_groups, so there is no
+    # cross-bucket sharing/padding. Sum each layer's own max memory usage.
+    page_sizes = {g.kv_cache_spec.page_size_bytes for g in kv_cache_groups}
+    if len(page_sizes) > 1:
+        return sum(
+            len(group.layer_names)
+            * group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
+            for group in kv_cache_groups
+        )
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
