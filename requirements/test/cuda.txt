@@ -1394,7 +1394,7 @@ wrapt==1.17.2
     # via smart-open
 xarray==2025.7.1
     # via rioxarray
-xxhash==3.5.0
+xxhash==4.0.1
     # via
     #   datasets
     #   evaluate
